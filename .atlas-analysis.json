@@ -1,0 +1,121 @@
+{
+  "projectType": "cli-tool",
+  "projectName": "FTL",
+  "projectDescription": "Zero-trust execution sandbox for AI coding agents with shadow credentials and adversarial testing.",
+  "theme": "aspen",
+  "primaryColor": "#2563eb",
+  "lightColor": "#60a5fa",
+  "darkColor": "#1e40af",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/how-it-works",
+              "concepts/zero-trust",
+              "concepts/shadow-credentials",
+              "concepts/sandbox"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/agents",
+              "guides/configuration",
+              "guides/interactive-shell",
+              "guides/aws-setup"
+            ]
+          },
+          {
+            "group": "Features",
+            "pages": [
+              "features/adversarial-testing",
+              "features/credential-proxy",
+              "features/aws-integration",
+              "features/tracing"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "CLI Reference",
+        "groups": [
+          {
+            "group": "Commands",
+            "pages": [
+              "cli/setup",
+              "cli/init",
+              "cli/code",
+              "cli/auth",
+              "cli/config",
+              "cli/snapshots",
+              "cli/logs"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/ftlconfig",
+              "configuration/environment-variables",
+              "configuration/ignore-files"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Advanced",
+        "groups": [
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/orchestrator",
+              "architecture/agents",
+              "architecture/sandbox-internals"
+            ]
+          },
+          {
+            "group": "Security",
+            "pages": [
+              "security/credential-linting",
+              "security/guardrails",
+              "security/best-practices"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Zero-trust Docker sandbox execution",
+    "Shadow credential injection - real keys never enter the container",
+    "Parallel adversarial test generation",
+    "Multi-agent support (Claude Code, Codex, Aider, Kiro)",
+    "Interactive shell with persistent sessions",
+    "HTTP/HTTPS credential-swap proxy with MITM",
+    "AWS integration (S3 snapshots, CloudWatch, Secrets Manager, Bedrock Guardrails)",
+    "Credential and dangerous operation linting",
+    "Project snapshot management with rsync or S3"
+  ],
+  "publicApiSurface": [
+    "ftl setup - Pull sandbox image, choose agent + tester, save API key",
+    "ftl init - Create .ftlconfig in current project",
+    "ftl code <task> - Run task, review, merge/reject",
+    "ftl - Interactive shell",
+    "ftl config --aws - Provision AWS resources and write config",
+    "ftl snapshots - List and manage project snapshots",
+    "ftl auth <KEY> <VALUE> - Save credential to ~/.ftl/credentials",
+    "ftl logs - Show session audit log"
+  ]
+}
