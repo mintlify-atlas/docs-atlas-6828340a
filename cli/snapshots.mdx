@@ -1,0 +1,212 @@
+---
+title: ftl snapshots
+description: List and manage project snapshots created by FTL coding sessions
+---
+
+## Overview
+
+The `ftl snapshots` command lists and manages snapshots created during FTL coding sessions. Snapshots capture all changes made by the AI agent, allowing you to review, restore, or clean up old snapshots.
+
+## Usage
+
+### List Snapshots
+
+```bash
+ftl snapshots [--all]
+```
+
+### Clean Snapshots
+
+```bash
+ftl snapshots clean [--last N] [--all] [--project-only] [-y]
+```
+
+## Options
+
+<ParamField path="--all" type="boolean" default="false">
+  Show snapshots for all projects instead of just the current project
+</ParamField>
+
+## List Command Examples
+
+### List Current Project Snapshots
+
+```bash
+$ ftl snapshots
+┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━┓
+┃ ID                   ┃ Project              ┃ Created         ┃
+┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━┩
+│ snap-abc123          │ /home/user/my-app    │ 2026-03-03 10:15│
+│ snap-def456          │ /home/user/my-app    │ 2026-03-03 14:22│
+└──────────────────────┴──────────────────────┴─────────────────┘
+```
+
+### List All Projects
+
+```bash
+$ ftl snapshots --all
+┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━┓
+┃ ID                   ┃ Project              ┃ Created         ┃
+┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━┩
+│ snap-abc123          │ /home/user/my-app    │ 2026-03-03 10:15│
+│ snap-ghi789          │ /home/user/other-app │ 2026-03-03 12:30│
+│ snap-def456          │ /home/user/my-app    │ 2026-03-03 14:22│
+└──────────────────────┴──────────────────────┴─────────────────┘
+```
+
+### No Snapshots Found
+
+```bash
+$ ftl snapshots
+No snapshots found.
+```
+
+## Clean Command
+
+The `snapshots clean` subcommand deletes snapshots based on specified criteria.
+
+### Clean Options
+
+<ParamField path="--last" type="integer">
+  Delete the N most recent snapshots
+</ParamField>
+
+<ParamField path="--all" type="boolean" default="false">
+  Delete all snapshots
+</ParamField>
+
+<ParamField path="--project-only" type="boolean" default="false">
+  Limit deletion to snapshots from the current project
+</ParamField>
+
+<ParamField path="-y, --yes" type="boolean" default="false">
+  Skip confirmation prompt
+</ParamField>
+
+## Clean Command Examples
+
+### Delete Last 3 Snapshots
+
+```bash
+$ ftl snapshots clean --last 3
+About to delete 3 snapshot(s):
+  snap-abc123  /home/user/my-app  2026-03-03 10:15
+  snap-def456  /home/user/my-app  2026-03-03 14:22
+  snap-ghi789  /home/user/my-app  2026-03-03 16:45
+
+Delete these snapshots? (y/n) > y
+  Deleted snap-abc123
+  Deleted snap-def456
+  Deleted snap-ghi789
+Done. 3 snapshot(s) removed.
+```
+
+### Delete All Snapshots (with confirmation)
+
+```bash
+$ ftl snapshots clean --all
+About to delete 5 snapshot(s):
+  snap-abc123  /home/user/my-app    2026-03-03 10:15
+  snap-def456  /home/user/my-app    2026-03-03 14:22
+  snap-ghi789  /home/user/other-app 2026-03-03 12:30
+  ...
+
+Delete these snapshots? (y/n) > y
+  Deleted snap-abc123
+  Deleted snap-def456
+  ...
+Done. 5 snapshot(s) removed.
+```
+
+### Delete All Project Snapshots (skip confirmation)
+
+```bash
+$ ftl snapshots clean --all --project-only -y
+  Deleted snap-abc123
+  Deleted snap-def456
+Done. 2 snapshot(s) removed.
+```
+
+### Cancel Deletion
+
+```bash
+$ ftl snapshots clean --last 5
+About to delete 5 snapshot(s):
+  ...
+
+Delete these snapshots? (y/n) > n
+Cancelled.
+```
+
+## Error Cases
+
+### No .ftlconfig and --all Not Specified
+
+```bash
+$ ftl snapshots
+No .ftlconfig found. Use --all or run 'ftl init'.
+```
+
+### Missing Clean Options
+
+```bash
+$ ftl snapshots clean
+Specify --last N or --all.
+```
+
+## Snapshot Storage
+
+### Local Mode
+
+Snapshots are stored in `~/.ftl/snapshots/` by default:
+
+```bash
+~/.ftl/snapshots/
+  snap-abc123/
+  snap-def456/
+```
+
+### AWS Mode
+
+When configured with `ftl config --aws`, snapshots are stored in S3:
+
+```
+s3://ftl-{account_id}-{region}/snapshots/
+  snap-abc123/
+  snap-def456/
+```
+
+## Snapshot Lifecycle
+
+1. **Created** - When `ftl code` completes a task
+2. **Listed** - View with `ftl snapshots`
+3. **Restored** - Apply changes to working directory (via FTL shell)
+4. **Cleaned** - Delete with `ftl snapshots clean`
+
+## Working with Snapshots in FTL Shell
+
+When using the interactive `ftl` shell, additional snapshot commands are available:
+
+```bash
+ftl> list
+  snap-abc123  /home/user/my-app
+  snap-def456  /home/user/my-app
+
+ftl> restore snap-abc123
+Restore snapshot snap-abc123?
+Are you sure? (y/n) > y
+Restored.
+```
+
+## Best Practices
+
+- Review snapshots regularly and clean up old ones to save disk space
+- Use `--project-only` when cleaning to avoid deleting snapshots from other projects
+- Always review the snapshot list before confirming deletion (unless using `-y`)
+- Keep important snapshots by not including them in bulk deletion
+
+## See Also
+
+- [ftl code](/cli/code) - Run tasks that create snapshots
+- [ftl logs](/cli/logs) - View session history
+- [ftl config](/cli/config) - Configure S3 snapshot storage

@@ -1,0 +1,247 @@
+---
+title: 'Environment Variables'
+description: 'Environment variable reference for FTL infrastructure and shadow credentials'
+---
+
+## Overview
+
+FTL uses environment variables for two distinct purposes:
+
+1. **FTL infrastructure credentials** - API keys for FTL itself (Anthropic, AWS, Langfuse)
+2. **Project credentials** - Secrets your agent needs, loaded from `.env` and shadowed
+
+## FTL Infrastructure Credentials
+
+These credentials are stored in `~/.ftl/credentials` and loaded automatically on every FTL invocation. You don't need to `export` them in each session.
+
+### Setting Credentials
+
+Use `ftl auth` to save credentials persistently:
+
+```bash
+ftl auth ANTHROPIC_API_KEY sk-ant-...
+ftl auth OPENAI_API_KEY sk-...
+ftl auth AWS_ACCESS_KEY_ID AKIA...
+ftl auth AWS_SECRET_ACCESS_KEY ...
+ftl auth AWS_DEFAULT_REGION us-east-1
+```
+
+### Credentials File Format
+
+The file `~/.ftl/credentials` uses a simple `KEY=VALUE` format:
+
+```bash ~/.ftl/credentials
+# FTL infrastructure credentials
+ANTHROPIC_API_KEY=sk-ant-...
+OPENAI_API_KEY=sk-...
+AWS_ACCESS_KEY_ID=AKIA...
+AWS_SECRET_ACCESS_KEY=...
+AWS_DEFAULT_REGION=us-east-1
+```
+
+- Lines starting with `#` are comments
+- Each line is `KEY=VALUE` (no quotes needed)
+- File permissions are set to `0600` (owner read/write only)
+- Values are loaded into `os.environ` at startup
+
+### Required Variables by Feature
+
+<ParamField path="ANTHROPIC_API_KEY" type="string">
+  **Required for:**
+  - Agent: `"claude-code"`
+  - Agent: `"aider"` (if using Anthropic models)
+  - Tester: `"claude-*"` models
+  
+  Get your key at [console.anthropic.com](https://console.anthropic.com)
+  
+  ```bash
+  ftl auth ANTHROPIC_API_KEY sk-ant-...
+  ```
+</ParamField>
+
+<ParamField path="OPENAI_API_KEY" type="string">
+  **Required for:**
+  - Agent: `"codex"`
+  - Agent: `"aider"` (if using OpenAI models)
+  - Tester: `"openai/*"` models
+  
+  ```bash
+  ftl auth OPENAI_API_KEY sk-...
+  ```
+</ParamField>
+
+<ParamField path="AWS_ACCESS_KEY_ID" type="string">
+  **Required for:**
+  - Snapshot backend: `"s3"`
+  - Secrets Manager integration
+  - Bedrock Guardrails
+  - CloudWatch tracing
+  - Tester: `"bedrock/*"` models
+  
+  ```bash
+  ftl auth AWS_ACCESS_KEY_ID AKIA...
+  ftl auth AWS_SECRET_ACCESS_KEY ...
+  ftl auth AWS_DEFAULT_REGION us-east-1
+  ```
+</ParamField>
+
+<ParamField path="AWS_SECRET_ACCESS_KEY" type="string">
+  AWS secret access key. Required for all AWS integrations.
+</ParamField>
+
+<ParamField path="AWS_DEFAULT_REGION" type="string">
+  AWS region for S3, Secrets Manager, CloudWatch, and Bedrock.
+  
+  **Default:** `us-east-1`
+</ParamField>
+
+### Optional Tracing Variables
+
+<ParamField path="LANGFUSE_PUBLIC_KEY" type="string">
+  Langfuse public key for LLM observability. Requires `pip install -e ".[tracing]"`.
+  
+  ```bash
+  ftl auth LANGFUSE_PUBLIC_KEY pk-lf-...
+  ftl auth LANGFUSE_SECRET_KEY sk-lf-...
+  ```
+</ParamField>
+
+<ParamField path="LANGFUSE_SECRET_KEY" type="string">
+  Langfuse secret key. Required when using Langfuse tracing.
+</ParamField>
+
+<ParamField path="LANGFUSE_HOST" type="string">
+  Langfuse API host.
+  
+  **Default:** `https://cloud.langfuse.com`
+  
+  ```bash
+  ftl auth LANGFUSE_HOST https://cloud.langfuse.com
+  ```
+</ParamField>
+
+## Project Credentials (Shadow System)
+
+### How Shadow Credentials Work
+
+FTL generates fake "shadow" values for your real credentials and injects only the shadows into the sandbox. The agent never sees your real keys.
+
+**Your `.env` file:**
+```bash .env
+STRIPE_SECRET_KEY=sk_live_abc123
+OPENAI_API_KEY=sk-proj-...
+```
+
+**Injected into sandbox:**
+```bash
+STRIPE_SECRET_KEY=ftl_shadow_stripe_secret_key_7f8a2b3c
+OPENAI_API_KEY=ftl_shadow_openai_api_key_4d9e2a1f
+```
+
+The agent writes code using these shadow values. FTL's lint scanner checks the diff for leaked shadows before merge.
+
+### Shadow Value Format
+
+Shadow values follow a recognizable pattern:
+
+```
+ftl_shadow_{lowercase_var_name}_{random_hex}
+```
+
+Generation: `ftl/credentials.py:64-67`
+
+### Loading Project Credentials
+
+FTL loads project credentials from two sources:
+
+1. **`.env` file** in project root - Every `KEY=VALUE` pair is treated as sensitive
+2. **`shadow_env` config** - Additional var names from `.ftlconfig` pulled from host `os.environ`
+
+```json .ftlconfig
+{
+  "shadow_env": ["MY_EXTRA_SECRET"]
+}
+```
+
+Loading logic: `ftl/credentials.py:70-91`
+
+### Credential Swap Table
+
+For the optional network proxy feature, FTL builds a swap table mapping shadow values to real values:
+
+```python
+swap_table = {
+  "ftl_shadow_stripe_secret_key_7f8a2b3c": "sk_live_abc123",
+  "ftl_shadow_openai_api_key_4d9e2a1f": "sk-proj-..."
+}
+```
+
+At the network layer, the HTTP/HTTPS proxy replaces shadow bytes with real values before requests reach upstream servers.
+
+Swap table generation: `ftl/credentials.py:94-111`
+
+### Forwarding Non-Sensitive Variables
+
+Use `agent_env` in `.ftlconfig` to forward environment variables **without shadowing**:
+
+```json .ftlconfig
+{
+  "agent_env": ["NODE_ENV", "DEBUG", "LOG_LEVEL"]
+}
+```
+
+These values are passed directly to the sandbox from your host `os.environ`.
+
+## AWS Secrets Manager Integration
+
+When `secrets_manager_prefix` is set in `.ftlconfig`, FTL fetches secrets from AWS Secrets Manager instead of reading `.env`.
+
+```json .ftlconfig
+{
+  "secrets_manager_prefix": "/myproject/prod/"
+}
+```
+
+### Secret Value Formats
+
+**JSON object secrets** are expanded:
+
+```json
+// Secret: /myproject/prod/database
+{
+  "DB_HOST": "postgres.example.com",
+  "DB_PASSWORD": "secret123"
+}
+
+// Loaded as:
+DB_HOST=postgres.example.com
+DB_PASSWORD=secret123
+```
+
+**Plain string secrets** use the last path segment as the key name (uppercased):
+
+```
+// Secret: /myproject/prod/api_key
+// Value: "sk-abc123"
+
+// Loaded as:
+API_KEY=sk-abc123
+```
+
+Shadow values are generated from these secrets identically to `.env` loading.
+
+## Security Notes
+
+<Warning>
+- Your real `.env` file **never enters the container**
+- Shadow credentials are **session-specific** (regenerated on each run)
+- The `~/.ftl/credentials` file is set to mode `0600` (owner-only access)
+- FTL's lint scanner checks for leaked shadow values before merge
+</Warning>
+
+## Source Reference
+
+- Credentials loading: `ftl/credentials.py:10-35`
+- Shadow generation: `ftl/credentials.py:64-111`
+- Save credential: `ftl/credentials.py:38-61`
+- File location: `ftl/credentials.py:7`

@@ -1,0 +1,460 @@
+---
+title: Docker sandbox internals
+description: How FTL's persistent container system works under the hood
+---
+
+FTL uses Docker containers as isolated execution environments for AI coding agents. Containers are persistent — keyed by project path — so subsequent tasks reuse the same container with warm dependency caches and agent history.
+
+## Container lifecycle
+
+### Creation and persistence
+
+One persistent container per project path, identified by an MD5 hash of the absolute path:
+
+```python
+# From sandbox/docker.py:86-91
+def _container_file(project_path):
+    """Path to the persisted container ID file for this project."""
+    slug = hashlib.md5(str(project_path).encode()).hexdigest()[:12]
+    container_dir = Path.home() / ".ftl" / "containers"
+    container_dir.mkdir(parents=True, exist_ok=True)
+    return container_dir / slug
+```
+
+The container ID is written to `~/.ftl/containers/<hash>` on boot and read back on subsequent runs:
+
+```python
+# From sandbox/docker.py:152-175 (simplified)
+existing_id = None
+if self._project_path:
+    cfile = _container_file(self._project_path)
+    lock_path = _container_lock_file(self._project_path)
+    lock_fd = open(lock_path, "w")
+    try:
+        if _FCNTL_AVAILABLE:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)  # File lock for concurrent safety
+        if cfile.exists():
+            stored = cfile.read_text().strip()
+            if stored and self._is_alive(stored):
+                existing_id = stored
+                cfile.unlink(missing_ok=True)  # Claim it
+            else:
+                cfile.unlink(missing_ok=True)  # Stale reference
+    finally:
+        if _FCNTL_AVAILABLE:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+```
+
+<Info>
+  The file lock (`fcntl.flock`) prevents two concurrent `ftl code` invocations for the same project from claiming the same container.
+</Info>
+
+### Container reuse hierarchy
+
+FTL checks three sources for an existing container, in order:
+
+<Steps>
+  <Step title="Disk persistence">
+    Read `~/.ftl/containers/<hash>` to find the container ID saved from a previous session (even after process restart).
+  </Step>
+
+  <Step title="In-process standby">
+    Check the class variable `DockerSandbox._standby_id` for a container released earlier in the same Python process (interactive shell mode).
+
+    ```python
+    # From sandbox/docker.py:178-182
+    if existing_id is None:
+        with DockerSandbox._lock:
+            if DockerSandbox._standby_id and self._is_alive(DockerSandbox._standby_id):
+                existing_id = DockerSandbox._standby_id
+                DockerSandbox._standby_id = None
+    ```
+  </Step>
+
+  <Step title="Create fresh">
+    If no existing container is found, create a new one:
+
+    ```python
+    # From sandbox/docker.py:301-318
+    def _create(self):
+        snapshots_dir = str((Path.home() / ".ftl" / "snapshots").resolve())
+        Path(snapshots_dir).mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            "docker", "run", "-d",
+            "--network=bridge",
+            "--add-host=host.docker.internal:host-gateway",
+            "--memory=2g",
+            "--cpus=2",
+            "-v", f"{snapshots_dir}:/mnt/snapshots:ro",
+            "-w", "/workspace",
+            IMAGE,
+            "sleep", "infinity",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return result.stdout.strip()
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  Containers run `sleep infinity` as their entrypoint, keeping them alive indefinitely. All work happens via `docker exec`.
+</Note>
+
+## Workspace initialization
+
+On every task, `/workspace` is wiped and restored from the snapshot:
+
+```python
+# From sandbox/docker.py:351-365
+def _init_workspace(self, snapshot_id, wipe=False):
+    """Populate /workspace from snapshot. If wipe=True, clears it first."""
+    cmds = []
+    if wipe:
+        cmds.append("find /workspace -mindepth 1 -delete")
+    cmds.extend([
+        f"cp -a /mnt/snapshots/{snapshot_id}/. /workspace/",
+        "rm -f /workspace/.ftl_meta",
+        "chown -R ftl:ftl /workspace",
+    ])
+    result = self.exec_as_root("; ".join(cmds))
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to initialize workspace: {result.stderr or result.stdout}"
+        )
+```
+
+**What persists vs. what resets:**
+
+| Location | On task reset | Notes |
+|---|---|---|
+| `/workspace/` | **Wiped and restored** | Project files from snapshot |
+| `/home/ftl/.local/` | **Persists** | `pip install` packages |
+| `/usr/lib/python3/` | **Persists** | Pre-installed: stripe, requests, httpx, boto3, openai, anthropic, pydantic |
+| Global node_modules | **Persists** | `npm install -g` (TypeScript, ts-node, Jest, Claude Code) |
+| `/home/ftl/.claude/` | **Persists** | Claude Code conversation history |
+
+<Warning>
+  FTL does **not** wipe `/home/ftl/`. If the agent installs malicious packages globally, they persist across tasks until you manually destroy the container.
+</Warning>
+
+## Setup command
+
+On **fresh containers only**, FTL runs the `setup` command from `.ftlconfig` to install project dependencies:
+
+```python
+# From sandbox/docker.py:208-211
+if self.fresh and setup_cmd:
+    self._run_setup(setup_cmd)
+```
+
+```python
+# From sandbox/docker.py:328-337
+def _run_setup(self, cmd):
+    """Run the project setup command as the ftl user with credentials sourced."""
+    result = subprocess.run(
+        ["docker", "exec", "-u", "ftl", "-w", "/workspace",
+         self.container_id, "sh", "-c", self._with_env(cmd)],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    return result
+```
+
+Common pattern:
+
+```json
+{
+  "setup": "pip install -r requirements.txt 2>/dev/null; npm install --silent 2>/dev/null; true"
+}
+```
+
+The `true` at the end prevents a missing `requirements.txt` or `package.json` from failing the boot.
+
+<Info>
+  Setup only runs once per container. On warm reuse, packages are already installed in `/home/ftl/.local/` and global `node_modules`.
+</Info>
+
+## Command execution
+
+FTL provides two execution methods:
+
+### exec (blocking)
+
+```python
+# From sandbox/docker.py:225-237
+def exec(self, command, timeout=DEFAULT_TIMEOUT):
+    """Run a command inside the container with credentials sourced."""
+    try:
+        result = subprocess.run(
+            ["docker", "exec", self.container_id, "sh", "-c", self._with_env(command)],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, "", f"Command timed out after {timeout}s"
+
+    return result.returncode, result.stdout, result.stderr
+```
+
+Blocks until the command completes. Returns `(exit_code, stdout, stderr)`.
+
+### exec_stream (streaming)
+
+```python
+# From sandbox/docker.py:239-261
+def exec_stream(self, command, callback=None, timeout=DEFAULT_TIMEOUT):
+    """Run a command inside the container, streaming output line-by-line.
+
+    Merges stderr into stdout so errors appear live. Accumulates full output
+    and returns (exit_code, stdout, stderr) matching the exec() interface.
+    """
+    proc = subprocess.Popen(
+        ["docker", "exec", self.container_id, "sh", "-c", self._with_env(command)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    lines = []
+    try:
+        for line in proc.stdout:
+            lines.append(line)
+            if callback:
+                callback(line)
+    except KeyboardInterrupt:
+        proc.terminate()
+        raise
+    proc.wait()
+    return proc.returncode, "".join(lines), ""
+```
+
+Used for agent execution. Calls `callback(line)` for each line of output, enabling live progress display.
+
+## Environment variable injection
+
+Shadow credentials and agent auth keys are written to `/tmp/.ftl_env` inside the container:
+
+```python
+# From sandbox/docker.py:196-206
+all_env = {**self._credentials, **self._agent_env}
+if all_env:
+    env_lines = "\n".join(f"export {k}='{v}'" for k, v in all_env.items())
+    subprocess.run(
+        ["docker", "exec", self.container_id, "sh", "-c",
+         f"cat > {ENV_FILE} << 'FTLEOF'\n{env_lines}\nFTLEOF"],
+        capture_output=True,
+    )
+```
+
+All commands source this file before execution:
+
+```python
+# From sandbox/docker.py:219-223
+def _with_env(self, cmd):
+    """Prepend ENV_FILE sourcing if any credentials/agent env are configured."""
+    if self._credentials or self._agent_env:
+        return f". {ENV_FILE} && {cmd}"
+    return cmd
+```
+
+<Info>
+  Root commands (`exec_as_root`) do **not** source the env file. They run as the `root` user for system operations like installing the proxy CA.
+</Info>
+
+## Diff computation
+
+FTL computes diffs **inside the container** to avoid host-side Python walking through Docker's VirtioFS layer:
+
+```python
+# From sandbox/docker.py:263-283 (simplified)
+def get_diff(self, snapshot_path):
+    """Return structured diffs by comparing /workspace against the snapshot.
+
+    The comparison runs inside the Linux VM container — no host-side Python
+    walking through VirtioFS. Returns the same format as diff.compute_diff().
+    """
+    snapshot_id = Path(snapshot_path).name
+    script = _DIFF_SCRIPT_TMPL.format(snapshot_id=snapshot_id)
+    cmd = (
+        f"cat > /tmp/_ftl_diff.py << 'PYEOF'\n{script}\nPYEOF\n"
+        "python3 /tmp/_ftl_diff.py\n"
+        "rm -f /tmp/_ftl_diff.py"
+    )
+    result = self.exec_as_root(cmd)
+    try:
+        overlay_changes = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+    from ftl.diff import compute_diff_from_overlay
+    return compute_diff_from_overlay(overlay_changes, snapshot_path)
+```
+
+The diff script is a Python program that runs inside the container:
+
+```python
+# From sandbox/docker.py:22-83 (simplified)
+_DIFF_SCRIPT_TMPL = """
+import os, json, base64, hashlib
+from pathlib import Path
+
+SNAP = Path('/mnt/snapshots/{snapshot_id}')
+WORK = Path('/workspace')
+IGNORE = {{'__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache',
+           'node_modules', 'site-packages', 'venv', '.venv'}}
+
+def skip(rel):
+    p = Path(rel)
+    if p.name in SKIP_FILES:
+        return True
+    for part in p.parts:
+        if part in IGNORE or part.endswith(tuple(SUFFIXES)):
+            return True
+    return False
+
+def digest(path):
+    h = hashlib.md5()
+    try:
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(65536), b''):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+snap_files = {str(f.relative_to(SNAP)) for f in SNAP.rglob('*') if f.is_file() and not skip(...)}
+work_files = {str(f.relative_to(WORK)) for f in WORK.rglob('*') if f.is_file() and not skip(...)}
+
+results = []
+for rel in sorted(snap_files - work_files):
+    results.append({{'path': rel, 'deleted': True}})
+for rel in sorted(work_files - snap_files):
+    content = open(WORK / rel, 'rb').read()
+    results.append({{'path': rel, 'deleted': False,
+                     'content_b64': base64.b64encode(content).decode()}})
+for rel in sorted(snap_files & work_files):
+    if digest(SNAP / rel) != digest(WORK / rel):
+        content = open(WORK / rel, 'rb').read()
+        results.append({{'path': rel, 'deleted': False,
+                         'content_b64': base64.b64encode(content).decode()}})
+
+print(json.dumps(results))
+"""
+```
+
+This approach is much faster than `os.walk()` on the host side, especially for large projects.
+
+## Node.js pre-warming
+
+To eliminate the 5-8s cold-start penalty on first agent use, FTL runs a background thread that loads Claude Code into the Linux page cache:
+
+```python
+# From sandbox/docker.py:213-215
+# Pre-warm Node.js in the background — loads Claude Code modules into the
+# Linux page cache so the first agent invocation doesn't pay cold-start cost.
+threading.Thread(target=self._prewarm_node, daemon=True).start()
+```
+
+```python
+# From sandbox/docker.py:339-349
+def _prewarm_node(self):
+    """Load Claude Code into the Linux page cache by running a no-op invocation.
+
+    Runs in a background thread during boot() so the first agent task doesn't
+    pay the Node.js cold-start penalty (~5-8s).
+    """
+    subprocess.run(
+        ["docker", "exec", "-u", "ftl", self.container_id, "sh", "-c", "claude --version"],
+        capture_output=True,
+        timeout=30,
+    )
+```
+
+<Note>
+  By the time you see "Running agent...", Node.js is already warm. The first task executes immediately with no cold-start delay.
+</Note>
+
+## Cleanup and standby
+
+When a session ends, the container is **not** destroyed. It's released for reuse:
+
+```python
+# From sandbox/docker.py:285-290
+def standby(self):
+    """Release the container — keep it running for reuse (disk + class var)."""
+    with DockerSandbox._lock:
+        DockerSandbox._standby_id = self.container_id
+    # Disk file already written in boot(); nothing more to do here
+    self.container_id = None
+```
+
+The container ID remains in `~/.ftl/containers/<hash>` and in the class variable for in-process reuse.
+
+**Atexit handler:**
+
+```python
+# From sandbox/docker.py:375-383
+def _cleanup_on_exit(self):
+    """On process exit, leave containers running — they're reused by the next invocation.
+
+    Only clears in-memory references; the disk file written in boot() ensures
+    the container is found again even after the process restarts.
+    """
+    self.container_id = None
+    with DockerSandbox._lock:
+        DockerSandbox._standby_id = None
+```
+
+Containers are never automatically destroyed. To manually remove a container:
+
+```bash
+docker ps -a                # Find the container ID
+docker rm -f <container_id>
+rm ~/.ftl/containers/<hash> # Clear the persisted reference
+```
+
+## Resource constraints
+
+```python
+# From sandbox/docker.py:306-312
+[
+    "docker", "run", "-d",
+    "--network=bridge",
+    "--add-host=host.docker.internal:host-gateway",
+    "--memory=2g",
+    "--cpus=2",
+]
+```
+
+- **Memory:** 2GB (hard limit)
+- **CPU:** 2 cores
+- **Network:** Bridge mode with `host.docker.internal` gateway for proxy access
+
+<Warning>
+  These limits are not user-configurable. If the agent needs more resources, it will hit OOM or CPU throttling.
+</Warning>
+
+## Image variants
+
+FTL uses Docker Hub images based on the agent selection from `ftl setup`:
+
+```
+vvenne/ftl:latest   — Claude Code
+vvenne/ftl:codex    — Codex
+vvenne/ftl:aider    — Aider
+vvenne/ftl:kiro     — Kiro
+vvenne/ftl:full     — all agents
+```
+
+The image name is hardcoded in `sandbox/docker.py:15`:
+
+```python
+IMAGE = "ftl-sandbox:latest"
+```
+
+<Info>
+  In production, this is overridden by the CLI to match the selected agent. The Dockerfile includes all common dependencies: Python 3.11+, Node.js, git, curl, rsync, etc.
+</Info>

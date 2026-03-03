@@ -1,0 +1,393 @@
+---
+title: Session Orchestration
+description: Session lifecycle, state management, and parallel execution
+---
+
+The `Session` class in `orchestrator.py` manages the complete lifecycle of an FTL coding task, from snapshot creation through agent execution to diff review and merge.
+
+## Session Class
+
+The `Session` object coordinates all components:
+
+```python
+class Session:
+    """An active FTL coding session.
+
+    Manages the sandbox, agent, and diff state for a task.
+    Agent and tester run in parallel — tests are generated from the task
+    description while the agent codes, then run immediately when both finish.
+    """
+```
+
+**Key responsibilities:**
+- Snapshot project state
+- Boot or reuse containers
+- Inject shadow credentials
+- Coordinate parallel agent + test execution
+- Compute diffs lazily on demand
+- Manage review and merge workflow
+
+## Session Lifecycle
+
+### 1. Initialization
+
+```python
+def __init__(self):
+    self.console = Console()
+    self.config = load_config()
+    self.config_path = find_config()
+    self.project_path = str(self.config_path.parent)
+
+    self.agent_name = self.config.get("agent", "claude-code")
+    self.tester = self.config.get("tester", "bedrock/us.anthropic.claude-sonnet-4-6")
+    self.trace_id = uuid.uuid4().hex[:8]
+
+    self.sandbox = None
+    self.agent = None
+    self.diffs = None
+    self._proxy = None
+```
+
+Each session gets:
+- A unique 8-character trace ID
+- Configuration loaded from `.ftlconfig` and global defaults
+- Lazy-initialized sandbox, agent, and diff state
+
+<Info>
+The trace ID appears in all console output and CloudWatch logs, making it easy to correlate events across distributed systems.
+</Info>
+
+### 2. Snapshot (`orchestrator.py:136-143`)
+
+The project is snapshotted to `~/.ftl/snapshots/<id>` using rsync or S3:
+
+```python
+snapshot_store = create_snapshot_store(self.config)
+self.snapshot_id = snapshot_store.create(self.project_path)
+self.snapshot_path = str(Path.home() / ".ftl" / "snapshots" / self.snapshot_id)
+```
+
+Snapshots respect `.ftlignore` and skip common directories like `node_modules`, `__pycache__`, `.venv`.
+
+### 3. Shadow Credentials (`orchestrator.py:145-177`)
+
+FTL generates fake credentials that the agent will see inside the container:
+
+**Local mode** (default):
+```python
+extra_vars = self.config.get("shadow_env", [])
+self.shadow_env, swap_table = build_shadow_map(self.project_path, extra_vars)
+```
+
+**AWS mode** (when `secrets_manager_prefix` is set):
+```python
+from ftl.secrets import load_from_secrets_manager
+from ftl.credentials import generate_shadow_key
+sm_secrets = load_from_secrets_manager(sm_prefix)
+for name, real_value in sm_secrets.items():
+    shadow_value = generate_shadow_key(name)
+    self.shadow_env[name] = shadow_value
+    swap_table[shadow_value] = real_value
+```
+
+The `swap_table` maps shadow→real values for use by the optional network proxy.
+
+### 4. Credential-Swap Proxy (`orchestrator.py:166-177`)
+
+If `cryptography` is installed and there are credentials to swap:
+
+```python
+self._proxy = _try_start_proxy(swap_table)
+if self._proxy:
+    self.console.print(
+        f"  Proxy: credential swap active on port {self._proxy.port}"
+    )
+```
+
+The proxy:
+- Starts an HTTP/HTTPS MITM server on the host
+- Generates an ephemeral CA certificate
+- Provides environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `REQUESTS_CA_BUNDLE`) to inject into the container
+- Swaps shadow→real credentials in outbound requests at the network layer
+
+<Note>
+Without the proxy, agents see shadow values in environment variables. Live API calls will fail unless the service happens to accept the fake keys.
+</Note>
+
+### 5. Agent Authentication (`orchestrator.py:180-203`)
+
+FTL forwards agent-specific API keys from the host into the container:
+
+```python
+AGENT_AUTH_VARS = {
+    "claude-code": ["ANTHROPIC_API_KEY"],
+    "kiro": ["KIRO_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION"],
+    "codex": ["OPENAI_API_KEY"],
+    "aider": ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"],
+}
+
+agent_env = _collect_agent_env(self.agent_name, self.config)
+```
+
+**Validation before boot:**
+```python
+required_key = AGENT_REQUIRED_KEY.get(self.agent_name)
+if required_key and required_key not in agent_env:
+    self.console.print(
+        f"[bold red]{required_key} is not set.[/bold red]\n"
+        f"  Run: ftl auth {required_key} <your-key>"
+    )
+    raise SystemExit(1)
+```
+
+This fails fast if the agent won't be able to run, before spending time on sandbox boot.
+
+### 6. Sandbox Boot (`orchestrator.py:205-231`)
+
+```python
+self.sandbox = create_sandbox()
+self.sandbox.boot(
+    self.snapshot_path,
+    credentials=self.shadow_env,
+    agent_env=agent_env,
+    project_path=self.project_path,
+    setup_cmd=self.config.get("setup"),
+)
+```
+
+**Container reuse logic:**
+1. Check disk for persisted container ID (survives process restarts)
+2. Fall back to class-level standby from earlier in this process
+3. Create fresh if neither exists
+
+**On fresh containers only:**
+```python
+if self.fresh and self.config.get("setup"):
+    self.console.print("  Setup: ran on fresh container")
+```
+
+Setup commands (e.g., `pip install -r requirements.txt`) run once and persist in `/home/ftl/.local/`.
+
+### 7. Parallel Agent + Test Execution (`orchestrator.py:233-274`)
+
+The agent and test generator run concurrently:
+
+```python
+with ThreadPoolExecutor(max_workers=2) as executor:
+    agent_future = executor.submit(_run_agent)
+    test_future = executor.submit(generate_tests_from_task, task, self.tester)
+
+try:
+    agent_future.result()
+except Exception as e:
+    self.console.print(f"[yellow]  Agent error: {e}[/yellow]")
+
+test_code = test_future.result()
+if test_code:
+    self.console.print("[bold]Running tests...[/bold]")
+    run_test_code(test_code, self.sandbox, self.console)
+```
+
+**Why parallel?** Test generation can take 10-30s. By running it while the agent codes, tests are usually ready before coding finishes — no added wall-clock time.
+
+**Streaming output:**
+```python
+def _stream(line):
+    heartbeat.stop()
+    renderer.feed(line)
+result = self.agent.run(task, "/workspace", self.sandbox, callback=_stream)
+```
+
+The `AgentRenderer` parses Claude Code's `stream-json` output and displays per-tool progress counters live.
+
+### 8. Diff Computation (`orchestrator.py:286-290`)
+
+Diffs are computed **lazily** — only when first accessed:
+
+```python
+def _get_diffs(self):
+    """Return diffs, computing lazily on first call."""
+    if self.diffs is None and self.sandbox:
+        self.diffs = self.sandbox.get_diff(self.snapshot_path)
+    return self.diffs or []
+```
+
+The diff runs **inside the Linux container** to avoid host-side Python walking through VirtioFS per file.
+
+### 9. Merge Workflow (`orchestrator.py:321-384`)
+
+**Lint scan:**
+```python
+violations = lint_diffs(diffs, self.shadow_env)
+display_violations(violations)
+```
+
+Checks for:
+- Hardcoded shadow credentials
+- Known credential patterns (Stripe keys, AWS keys, GitHub PATs, etc.)
+- Dangerous SQL (`DROP TABLE`, `TRUNCATE`, `DELETE FROM` without `WHERE`)
+- Dangerous shell (`rm -rf`, `chmod -R 777`, etc.)
+
+**Optional Guardrail** (when `guardrail_id` is set):
+```python
+from ftl.guardrails import apply_guardrail
+from ftl.diff import diff_to_text
+blocked, gr_findings = apply_guardrail(
+    guardrail_id,
+    self.config.get("guardrail_version", "DRAFT"),
+    diff_to_text(diffs),
+)
+if blocked:
+    self.console.print("[bold red]Guardrail blocked merge. Changes discarded.[/bold red]")
+    self._cleanup()
+    return
+```
+
+**Human review:**
+```python
+approved = review_diff(diffs, planner_model)
+
+if approved:
+    self.console.print("[bold green]Approved. Merging changes...[/bold green]")
+    _merge_changes(diffs, self.workspace, self.project_path)
+else:
+    self.console.print("[bold red]Rejected. Changes discarded.[/bold red]")
+
+self._cleanup()
+```
+
+### 10. Cleanup (`orchestrator.py:398-411`)
+
+```python
+def _cleanup(self):
+    """Put sandbox on standby and clear session state."""
+    if self.sandbox:
+        self.sandbox.standby()
+        self.console.print(f"[dim]Snapshot {self.snapshot_id} available for rollback.[/dim]")
+    if self._proxy:
+        self._proxy.stop()
+        self._proxy = None
+    self.sandbox = None
+    self.agent = None
+```
+
+**Container is NOT destroyed** — it's marked as standby and persisted to disk for the next task.
+
+## Interactive Mode
+
+### Follow-up Instructions (`orchestrator.py:292-304`)
+
+```python
+def follow_up(self, message):
+    """Send a follow-up instruction to the agent (continues the session)."""
+    if not self.sandbox:
+        self.console.print("[red]No active session. Type a task first.[/red]")
+        return
+
+    renderer = AgentRenderer(self.console, trace_id=self.trace_id)
+    self.agent.continue_run(message, "/workspace", self.sandbox, callback=renderer.feed)
+    renderer.finish()
+    self.agent_calls += 1
+    self.diffs = None  # invalidate; recomputed on next access
+```
+
+Follow-ups:
+- Continue the same agent conversation in the same container
+- Invalidate cached diffs (will recompute on next `show_diff()` or `merge()`)
+- No snapshot/boot overhead — the container is already warm
+
+### Manual Commands
+
+**Show diff:**
+```python
+def show_diff(self):
+    display_diff(self._get_diffs())
+```
+
+**Run tests:**
+```python
+def run_tests(self):
+    diffs = self._get_diffs()
+    if not diffs:
+        self.console.print("[dim]No changes to test.[/dim]")
+        return
+    run_verification(diffs, self.tester, self.sandbox)
+```
+
+**Reject changes:**
+```python
+def reject(self):
+    self.console.print("[bold red]Changes discarded.[/bold red]")
+    write_log({...}, trace_id=self.trace_id)
+    self._cleanup()
+```
+
+## One-Shot Mode (`orchestrator.py:437-448`)
+
+```python
+def run_task(task):
+    """One-shot mode: run task, review, merge/reject, done."""
+    t0 = time.time()
+    session = Session()
+    session.start(task)
+
+    elapsed = _fmt_elapsed(time.time() - t0)
+    session.console.print(f"\n[dim]Completed in {elapsed}[/dim]")
+    _notify("FTL", f"Done in {elapsed}")
+
+    session.merge()
+```
+
+Used by `ftl code "task"` — starts a session, runs the task, auto-triggers merge/review, then exits.
+
+## State Management
+
+| Property | Type | Lifecycle |
+|----------|------|----------|
+| `trace_id` | `str` | Per session |
+| `snapshot_id` | `str` | Per session |
+| `sandbox` | `Sandbox` | Active → Standby → Reused |
+| `agent` | `Agent` | Active → None |
+| `diffs` | `list` | Lazy, cached until invalidated |
+| `_proxy` | `CredentialSwapProxy` | Active → Stopped |
+| `agent_calls` | `int` | Increments on follow-ups |
+
+## Tracing and Logging
+
+**CloudWatch events** (when `cloudwatch_log_group` is set):
+```python
+cloudwatch.emit(self.trace_id, "stage", "snapshot", elapsed_ms=elapsed * 1000)
+cloudwatch.emit(self.trace_id, "stage", "boot", elapsed_ms=elapsed * 1000)
+cloudwatch.emit(self.trace_id, "stage", "agent", elapsed_ms=elapsed * 1000)
+cloudwatch.emit(self.trace_id, "stage", "tests", elapsed_ms=elapsed * 1000)
+```
+
+**Local audit log** (`~/.ftl/logs.jsonl`):
+```python
+write_log({
+    "event": "session_start",
+    "task": task,
+    "snapshot": self.snapshot_id,
+    "project": self.project_path,
+    "agent": self.agent_name,
+}, trace_id=self.trace_id)
+```
+
+## Performance Optimizations
+
+1. **Persistent containers** — No cold-boot overhead after first task
+2. **Parallel test generation** — Zero wall-clock time added for tests
+3. **Lazy diff computation** — Only computed when needed
+4. **Node.js pre-warm** — Background thread loads Claude Code into page cache during boot
+5. **Linux-internal diff** — Runs inside container, avoids host-side VirtioFS overhead
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Agent Adapters" icon="robot" href="/architecture/agents">
+    How agents execute tasks inside the sandbox
+  </Card>
+  <Card title="Sandbox Internals" icon="container-storage" href="/architecture/sandbox-internals">
+    Container lifecycle, workspace management, and diff computation
+  </Card>
+</CardGroup>

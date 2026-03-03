@@ -1,0 +1,296 @@
+---
+title: 'Supported Agents'
+description: 'Run Claude Code, Codex, Aider, or Kiro inside FTL sandboxes'
+---
+
+FTL supports four coding agents, each running inside an isolated Docker sandbox with shadow credentials and zero-trust controls.
+
+## Available Agents
+
+<CardGroup cols={2}>
+  <Card title="Claude Code" icon="robot" iconType="duotone">
+    Anthropic's recommended agent with stream-JSON output
+  </Card>
+  <Card title="Codex" icon="code" iconType="duotone">
+    OpenAI's coding agent
+  </Card>
+  <Card title="Aider" icon="terminal" iconType="duotone">
+    Open-source AI pair programming tool
+  </Card>
+  <Card title="Kiro" icon="aws" iconType="duotone">
+    AWS-powered coding agent with browser-based login
+  </Card>
+</CardGroup>
+
+## Agent Configuration
+
+### Selecting an Agent
+
+Choose your agent during initial setup:
+
+```bash
+ftl setup
+```
+
+Or set the `agent` field in `.ftlconfig`:
+
+```json .ftlconfig
+{
+  "agent": "claude-code",
+  "tester": "claude-haiku-4-5-20251001"
+}
+```
+
+### Agent Requirements
+
+| Agent | Config Key | Required Credentials |
+|-------|-----------|----------------------|
+| Claude Code | `"claude-code"` | `ANTHROPIC_API_KEY` |
+| Codex | `"codex"` | `OPENAI_API_KEY` |
+| Aider | `"aider"` | `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` |
+| Kiro | `"kiro"` | AWS credentials + browser login |
+
+## Agent-Specific Setup
+
+<Tabs>
+  <Tab title="Claude Code">
+    Claude Code is the recommended agent with full stream-JSON output support.
+
+    <Steps>
+      <Step title="Get API Key">
+        Obtain your Anthropic API key from [console.anthropic.com](https://console.anthropic.com)
+      </Step>
+      
+      <Step title="Save Credentials">
+        ```bash
+        ftl auth ANTHROPIC_API_KEY sk-ant-...
+        ```
+      </Step>
+      
+      <Step title="Configure Project">
+        ```json .ftlconfig
+        {
+          "agent": "claude-code",
+          "tester": "claude-haiku-4-5-20251001"
+        }
+        ```
+      </Step>
+    </Steps>
+
+    **Docker Image:** `vvenne/ftl:latest`
+  </Tab>
+
+  <Tab title="Codex">
+    OpenAI's Codex agent for code generation tasks.
+
+    <Steps>
+      <Step title="Get API Key">
+        Obtain your OpenAI API key from the OpenAI platform
+      </Step>
+      
+      <Step title="Save Credentials">
+        ```bash
+        ftl auth OPENAI_API_KEY sk-...
+        ```
+      </Step>
+      
+      <Step title="Configure Project">
+        ```json .ftlconfig
+        {
+          "agent": "codex",
+          "tester": "claude-haiku-4-5-20251001"
+        }
+        ```
+      </Step>
+    </Steps>
+
+    **Docker Image:** `vvenne/ftl:codex`
+  </Tab>
+
+  <Tab title="Aider">
+    Open-source AI pair programming tool with flexible LLM backend support.
+
+    <Steps>
+      <Step title="Get API Key">
+        Obtain an API key from either:
+        - Anthropic: [console.anthropic.com](https://console.anthropic.com)
+        - OpenAI: OpenAI platform
+      </Step>
+      
+      <Step title="Save Credentials">
+        ```bash
+        ftl auth ANTHROPIC_API_KEY sk-ant-...
+        # OR
+        ftl auth OPENAI_API_KEY sk-...
+        ```
+      </Step>
+      
+      <Step title="Configure Project">
+        ```json .ftlconfig
+        {
+          "agent": "aider",
+          "tester": "claude-haiku-4-5-20251001"
+        }
+        ```
+      </Step>
+    </Steps>
+
+    **Docker Image:** `vvenne/ftl:aider`
+  </Tab>
+
+  <Tab title="Kiro">
+    AWS-powered agent requiring browser-based SSO authentication.
+
+    <Steps>
+      <Step title="Configure AWS Credentials">
+        Set up AWS credentials using any standard method:
+        
+        ```bash
+        # Option 1: AWS CLI
+        aws configure
+
+        # Option 2: FTL auth
+        ftl auth AWS_ACCESS_KEY_ID AKIA...
+        ftl auth AWS_SECRET_ACCESS_KEY ...
+        ftl auth AWS_DEFAULT_REGION us-east-1
+        ```
+      </Step>
+      
+      <Step title="Configure Project">
+        ```json .ftlconfig
+        {
+          "agent": "kiro",
+          "tester": "claude-haiku-4-5-20251001"
+        }
+        ```
+      </Step>
+      
+      <Step title="Run First Task">
+        ```bash
+        ftl code 'your task here'
+        ```
+      </Step>
+      
+      <Step title="Complete Browser Login">
+        After the container starts, authenticate via browser:
+        
+        ```bash
+        docker exec -it $(docker ps -q --filter ancestor=vvenne/ftl:kiro) kiro-cli login
+        ```
+        
+        Credentials persist in the container until it is removed.
+      </Step>
+    </Steps>
+
+    **Docker Image:** `vvenne/ftl:kiro`
+  </Tab>
+</Tabs>
+
+## Docker Images
+
+FTL pulls the appropriate Docker image automatically based on your agent selection:
+
+```bash
+vvenne/ftl:latest   # Claude Code
+vvenne/ftl:codex    # Codex
+vvenne/ftl:aider    # Aider
+vvenne/ftl:kiro     # Kiro
+vvenne/ftl:full     # All agents
+```
+
+### Local Fallback Builds
+
+If Docker Hub is unavailable, FTL builds the image locally using the base Dockerfile plus agent-specific layers:
+
+<Accordion title="Codex Build Snippet">
+  ```dockerfile
+  RUN npm install -g @openai/codex && npm cache clean --force
+  ```
+</Accordion>
+
+<Accordion title="Aider Build Snippet">
+  ```dockerfile
+  RUN pip3 install --break-system-packages aider-chat
+  ```
+</Accordion>
+
+<Accordion title="Kiro Build Snippet (Architecture-Aware)">
+  ```dockerfile
+  RUN apt-get update && apt-get install -y --no-install-recommends unzip \
+    && ARCH=$(uname -m) \
+    && if [ "$ARCH" = "x86_64" ]; then \
+      curl -fsSL https://desktop-release.q.us-east-1.amazonaws.com/latest/kiro-cli.deb -o /tmp/kiro-cli.deb \
+      && dpkg -i /tmp/kiro-cli.deb && apt-get install -f -y --no-install-recommends \
+      && rm -f /tmp/kiro-cli.deb; \
+    elif [ "$ARCH" = "aarch64" ]; then \
+      curl -fsSL https://desktop-release.q.us-east-1.amazonaws.com/latest/kirocli-aarch64-linux.zip -o /tmp/kiro.zip \
+      && unzip /tmp/kiro.zip -d /tmp/kiro-extract \
+      && if [ -f /tmp/kiro-extract/install.sh ]; then PREFIX=/usr/local bash /tmp/kiro-extract/install.sh; \
+      else find /tmp/kiro-extract -type f -name kiro-cli -exec install -m755 {} /usr/local/bin/kiro-cli \;; fi \
+      && rm -rf /tmp/kiro.zip /tmp/kiro-extract; \
+    fi \
+    && rm -rf /var/lib/apt/lists/*
+  ```
+</Accordion>
+
+## Switching Agents
+
+To switch agents on an existing project:
+
+<Steps>
+  <Step title="Update Configuration">
+    Edit `.ftlconfig` to change the agent:
+    
+    ```json .ftlconfig
+    {
+      "agent": "aider",
+      "tester": "claude-haiku-4-5-20251001"
+    }
+    ```
+  </Step>
+  
+  <Step title="Pull New Image">
+    Run setup to pull the new agent's Docker image:
+    
+    ```bash
+    ftl setup
+    ```
+    
+    Select the new agent when prompted.
+  </Step>
+  
+  <Step title="Configure Credentials">
+    Ensure the required API keys for the new agent are configured:
+    
+    ```bash
+    ftl auth OPENAI_API_KEY sk-...
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  Persistent containers are keyed by project path, so switching agents will create a new container with the appropriate image.
+</Note>
+
+## Agent Behavior
+
+### Conversation History
+
+Agent conversation history persists across tasks in `/home/ftl/.claude/` inside the container. Follow-up instructions in the interactive shell continue the same conversation.
+
+### Pre-installed Dependencies
+
+All agents have access to common Python and Node.js packages:
+
+**Python:**
+- stripe, requests, httpx, boto3
+- openai, anthropic, pydantic
+- python-dotenv, pytest
+
+**Node.js:**
+- TypeScript, ts-node, Jest
+- Claude Code runtime (for all agents)
+
+### Warm Start Optimization
+
+FTL runs `claude --version` in the background during boot to load Node.js modules into the Linux page cache, eliminating the 5-8s cold-start penalty on first task.

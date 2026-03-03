@@ -1,0 +1,142 @@
+---
+title: Adversarial Testing
+description: Parallel test generation that runs alongside the coding agent to catch bugs early
+---
+
+FTL can generate adversarial tests in parallel with the coding agent, creating tests that actively try to break the implementation before the code is even complete.
+
+## How It Works
+
+The adversarial testing system runs a separate model alongside the primary coding agent:
+
+1. **Task-based generation** - Tests are generated from the task description alone, without seeing the implementation
+2. **Parallel execution** - The tester runs at the same time as the coder, not after
+3. **Adversarial focus** - Tests target edge cases, null inputs, boundary conditions, and unexpected usage
+4. **Real API testing** - No mocking - tests use actual API credentials from the environment
+
+<CodeGroup>
+```python Test Generation
+from ftl.planner import generate_tests_from_task
+
+# Generate tests from just the task description
+test_code = generate_tests_from_task(
+    task="Create a function that validates email addresses",
+    model="claude-3-5-sonnet-20241022"
+)
+```
+
+```python Running Tests
+from ftl.planner import run_test_code
+
+exit_code, output = run_test_code(
+    test_code=test_code,
+    sandbox=sandbox,
+    console=console
+)
+
+if exit_code == 0:
+    print("Tests passed")
+else:
+    print(f"Tests failed: {output}")
+```
+</CodeGroup>
+
+## Test Generation Strategy
+
+The test generator receives this system prompt:
+
+<Note>
+You are an adversarial test engineer. Given a coding task description, generate a test script that verifies the implementation is correct and tries to break it. Focus on edge cases, null inputs, boundary conditions, and unexpected usage. Your goal is to find bugs.
+</Note>
+
+Key characteristics:
+
+- **Language detection** - Automatically detects Python vs JavaScript from code patterns
+- **Auto-installation** - Installs missing test dependencies (pytest, etc.) on first failure
+- **Real credentials** - Uses environment variables for actual API testing
+
+## Language Support
+
+The system detects the language from the generated test code:
+
+```python Source: ftl/planner.py:63-68
+_js_signals = ("const ", "let ", "var ", "describe(", "it(", "require(")
+is_js = (
+    test_code.strip().startswith(_js_signals)
+    or "from '" in test_code[:300]
+    or 'from "' in test_code[:300]
+)
+```
+
+- **Python** - Uses `pytest` with `-v` flag
+- **JavaScript** - Runs with `node` directly
+
+## Manual Verification
+
+You can manually trigger verification on code changes:
+
+```python Source: ftl/planner.py:97-112
+def run_verification(diffs, tester, sandbox):
+    """Manual test trigger: generate tests from diff and run them."""
+    from ftl.diff import diff_to_text
+
+    console = Console()
+    console.print(f"[bold]Running verification ({tester})...[/bold]")
+
+    if tester in AGENTS:
+        agent = get_agent(tester)
+        diff_text = diff_to_text(diffs)
+        task = (
+            "Review the following code changes and write tests that try to break them. "
+            "Focus on edge cases, null inputs, boundary conditions, and unexpected usage. "
+            "Run the tests and report results.\n\n"
+            f"{diff_text}"
+        )
+```
+
+<Tip>
+Verification can use either a specific model or a full FTL agent for more sophisticated test generation.
+</Tip>
+
+## Missing Dependencies
+
+The test runner automatically handles missing modules:
+
+```python Source: ftl/planner.py:80-84
+# If tests failed due to missing modules, install them and retry once.
+missing = _extract_missing_modules(stdout + stderr)
+if missing and exit_code != 0:
+    sandbox.exec(f"pip install {' '.join(missing)} -q")
+    exit_code, stdout, stderr = sandbox.exec(run_cmd)
+```
+
+This extracts package names from `ModuleNotFoundError` messages and installs them automatically.
+
+## Configuration
+
+Adversarial testing is activated by passing a model name to the planner:
+
+```bash
+ftl --tester claude-3-5-sonnet-20241022
+```
+
+The tester can be:
+- A LiteLLM model name (e.g., `claude-3-5-sonnet-20241022`)
+- An FTL agent name for more advanced testing
+
+## Benefits
+
+<CardGroup cols={2}>
+  <Card title="Catch Bugs Early" icon="bug">
+    Find issues before the agent even finishes coding
+  </Card>
+  <Card title="No Mocking" icon="link">
+    Tests use real APIs with actual credentials
+  </Card>
+  <Card title="Edge Case Focus" icon="triangle-exclamation">
+    Adversarial mindset finds boundary conditions
+  </Card>
+  <Card title="Auto-Install" icon="download">
+    Missing test dependencies installed automatically
+  </Card>
+</CardGroup>

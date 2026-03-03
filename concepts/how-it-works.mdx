@@ -1,0 +1,242 @@
+---
+title: How it works
+description: Understanding the FTL workflow from task to approval
+---
+
+FTL executes AI coding tasks through an 8-stage workflow that isolates agent execution, generates adversarial tests in parallel, and ensures human oversight before any changes touch your project.
+
+## Workflow stages
+
+When you run `ftl code "build login component with Supabase auth"`, FTL executes the following pipeline:
+
+<Steps>
+  <Step title="Snapshot">
+    FTL creates a point-in-time snapshot of your project using rsync, respecting `.ftlignore` patterns. The snapshot is stored in `~/.ftl/snapshots/<id>` and serves as the baseline for diff computation.
+
+    ```python
+    # From orchestrator.py:138-141
+    snapshot_store = create_snapshot_store(self.config)
+    self.snapshot_id = snapshot_store.create(self.project_path)
+    self.snapshot_path = str(Path.home() / ".ftl" / "snapshots" / self.snapshot_id)
+    ```
+
+    <Info>
+      Snapshots can use S3 as a backend by setting `"snapshot_backend": "s3"` in `.ftlconfig`.
+    </Info>
+  </Step>
+
+  <Step title="Boot">
+    FTL boots a Docker container for your project. Containers are persistent — keyed by a hash of your project path — so subsequent tasks reuse the same container with warm dependency caches.
+
+    ```python
+    # From sandbox/docker.py:152-169
+    existing_id = None
+    if self._project_path:
+        cfile = _container_file(self._project_path)
+        lock_path = _container_lock_file(self._project_path)
+        lock_fd = open(lock_path, "w")
+        try:
+            if _FCNTL_AVAILABLE:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            if cfile.exists():
+                stored = cfile.read_text().strip()
+                if stored and self._is_alive(stored):
+                    existing_id = stored
+    ```
+
+    On fresh containers, FTL runs the `setup` command from `.ftlconfig` to install dependencies. On warm containers, `/workspace` is wiped and restored from the snapshot, but everything outside (Python packages in `/home/ftl/.local/`, Node modules, agent history) persists.
+
+    <Note>
+      FTL pre-warms Node.js by running `claude --version` in the background during boot, eliminating the 5-8s cold-start penalty on first use.
+    </Note>
+  </Step>
+
+  <Step title="Inject">
+    Shadow credentials replace real API keys inside the container. Your `.env` never enters the sandbox — the agent only sees fake values like `ftl_shadow_stripe_secret_key_7f8a2b3c`.
+
+    ```python
+    # From credentials.py:94-111
+    def build_shadow_map(project_path, extra_vars=None):
+        real_keys = load_real_keys(project_path, extra_vars)
+        shadow_env = {}
+        swap_table = {}
+        for name, real_value in real_keys.items():
+            shadow_value = generate_shadow_key(name)
+            shadow_env[name] = shadow_value
+            swap_table[shadow_value] = real_value
+        return shadow_env, swap_table
+    ```
+
+    When the network proxy is enabled (`pip install -e ".[proxy]"`), shadow values are swapped back to real keys at the network layer so live API calls work correctly.
+  </Step>
+
+  <Step title="Agent ∥ Tests">
+    The coding agent runs while adversarial tests generate in parallel. FTL uses `ThreadPoolExecutor` to execute both tasks concurrently — test generation doesn't add to wall-clock time.
+
+    ```python
+    # From orchestrator.py:254-256
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        agent_future = executor.submit(_run_agent)
+        test_future = executor.submit(generate_tests_from_task, task, self.tester)
+    ```
+
+    The agent writes code to `/workspace` inside the container. All API keys it sees are shadow values. Agent output streams line-by-line to your terminal.
+  </Step>
+
+  <Step title="Run tests">
+    Pre-generated tests execute the moment the agent finishes. Tests run inside the same sandbox with the same shadow credentials, validating the agent's changes against the task description.
+
+    ```python
+    # From orchestrator.py:269-273
+    test_code = test_future.result()
+    if test_code:
+        self.console.print("[bold]Running tests...[/bold]")
+        run_test_code(test_code, self.sandbox, self.console)
+    ```
+
+    <Info>
+      Test failures are informational — they don't block merge, but they help you spot logic errors before reviewing the diff.
+    </Info>
+  </Step>
+
+  <Step title="Lint">
+    FTL scans the diff for credential leaks and dangerous operations before showing you the review prompt.
+
+    **Credential violations:**
+    - Hardcoded shadow values (exact match or `ftl_shadow_*` pattern)
+    - Known credential patterns: Stripe keys, Anthropic keys, AWS access keys, GitHub PATs, etc.
+
+    **Dangerous operations (advisory only):**
+    - SQL: `DROP TABLE`, `DROP DATABASE`, `TRUNCATE`, `DELETE FROM` without `WHERE`
+    - Shell: `rm -rf`, `shred`, `dd if=`, `chmod -R 777`
+
+    ```python
+    # From lint.py:67-79
+    def lint_diffs(diffs, shadow_env=None):
+        violations = []
+        shadow_values = set((shadow_env or {}).values())
+        for diff in diffs:
+            for tag, content in diff["lines"]:
+                if tag != "+":
+                    continue
+                if SHADOW_PATTERN.search(content):
+                    violations.append(LintViolation(
+                        path, line_num, content,
+                        "Hardcoded shadow credential value"
+                    ))
+    ```
+
+    When Bedrock Guardrails is configured (`guardrail_id` in `.ftlconfig`), it replaces local lint and **hard-blocks** the merge if credentials or PII are detected.
+  </Step>
+
+  <Step title="Diff">
+    FTL computes the diff **inside the Linux container** by comparing `/workspace` against the snapshot. This avoids host-side Python walking through Docker's VirtioFS layer, which would be slow for large projects.
+
+    ```python
+    # From sandbox/docker.py:263-283 (simplified)
+    def get_diff(self, snapshot_path):
+        snapshot_id = Path(snapshot_path).name
+        script = _DIFF_SCRIPT_TMPL.format(snapshot_id=snapshot_id)
+        cmd = (
+            f"cat > /tmp/_ftl_diff.py << 'PYEOF'\n{script}\nPYEOF\n"
+            "python3 /tmp/_ftl_diff.py\n"
+            "rm -f /tmp/_ftl_diff.py"
+        )
+        result = self.exec_as_root(cmd)
+        overlay_changes = json.loads(result.stdout)
+        return compute_diff_from_overlay(overlay_changes, snapshot_path)
+    ```
+
+    The diff shows all file-level changes: created, modified, and deleted files with line-by-line context.
+  </Step>
+
+  <Step title="Approve">
+    You review the diff and decide:
+
+    - **`a`** — approve and merge changes to your project
+    - **`r`** — reject and discard all changes
+    - **Any other input** — ask the LLM a question about the diff (e.g., "does this handle null inputs?")
+
+    ```python
+    # From orchestrator.py:359-383 (simplified)
+    approved = review_diff(diffs, planner_model)
+    if approved:
+        _merge_changes(diffs, self.workspace, self.project_path)
+        self.console.print("  Changes merged to project.")
+    else:
+        self.console.print("[bold red]Rejected. Changes discarded.[/bold red]")
+    ```
+
+    Only approved changes touch your real filesystem. The container remains running for follow-up tasks.
+  </Step>
+</Steps>
+
+## Interactive mode
+
+Running `ftl` without a task argument starts an interactive shell. Follow-up instructions continue the same agent conversation in the same container:
+
+```bash
+ftl> build a login page with email and password
+
+ftl[active]> add form validation
+ftl[active]> diff     # show all changes since snapshot
+ftl[active]> test     # re-run tests manually
+ftl[active]> merge    # review diff, approve/reject
+```
+
+No cold boot between tasks. Dependencies stay cached. Agent history persists in `/home/ftl/.claude/`.
+
+## Container lifecycle
+
+<Info>
+  One persistent container per project path, keyed by a hash of the absolute path.
+</Info>
+
+| Location | On task reset | Notes |
+|---|---|---|
+| `/workspace/` | Wiped and restored | Project files from snapshot |
+| `/home/ftl/.local/` | Persists | `pip install` packages |
+| `/usr/lib/python3/` | Persists | Pre-installed: stripe, requests, httpx, boto3, openai, anthropic, pydantic |
+| Global node_modules | Persists | `npm install -g` (TypeScript, ts-node, Jest, Claude Code) |
+| `/home/ftl/.claude/` | Persists | Claude Code conversation history |
+
+```python
+# From sandbox/docker.py:351-365
+def _init_workspace(self, snapshot_id, wipe=False):
+    cmds = []
+    if wipe:
+        cmds.append("find /workspace -mindepth 1 -delete")
+    cmds.extend([
+        f"cp -a /mnt/snapshots/{snapshot_id}/. /workspace/",
+        "rm -f /workspace/.ftl_meta",
+        "chown -R ftl:ftl /workspace",
+    ])
+    result = self.exec_as_root("; ".join(cmds))
+```
+
+## Tracing and observability
+
+FTL prints elapsed time at each stage automatically:
+
+```
+Snapshotting project...       (0.3s)
+Booting sandbox...            (1.2s)
+Running agent...              (45.7s)
+Running tests...              (3.1s)
+```
+
+For full LLM observability, enable Langfuse:
+
+```bash
+pip install -e ".[tracing]"
+ftl auth LANGFUSE_PUBLIC_KEY pk-lf-...
+ftl auth LANGFUSE_SECRET_KEY sk-lf-...
+```
+
+When CloudWatch is configured (`cloudwatch_log_group` in `.ftlconfig`), FTL emits structured JSON events for each session stage:
+
+```python
+# From orchestrator.py:133-134
+cloudwatch.emit(self.trace_id, "session", "start",
+                task=task, project=self.project_path, agent=self.agent_name)
+```

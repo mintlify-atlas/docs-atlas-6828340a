@@ -1,0 +1,360 @@
+---
+title: Security Best Practices
+description: Recommendations for secure agent development with FTL
+---
+
+FTL provides multiple layers of defense against credential leaks and unsafe operations. Follow these best practices to maximize security when working with AI coding agents.
+
+## Zero-Trust Security Model
+
+FTL is built on a **zero-trust control plane**:
+
+> Agents are untrustworthy by construction. FTL is the layer that makes them safe to use anyway.
+
+Key principles:
+
+1. **Never trust agent output** — all changes require explicit human approval
+2. **Real credentials never enter the sandbox** — agents work with shadow values
+3. **Isolation first** — Docker sandbox with no host filesystem access
+4. **Multiple verification layers** — linting, guardrails, human review
+
+<Warning>
+The agent cannot have skin in the game. The human must. Every change requires explicit approval before it touches the real filesystem.
+</Warning>
+
+## Credential Management
+
+### Use Shadow Credentials
+
+FTL automatically generates shadow credentials for all environment variables in your `.env` file:
+
+```bash
+# Your .env (never enters sandbox)
+STRIPE_SECRET_KEY=sk_live_abc123
+OPENAI_API_KEY=sk-proj-xyz789
+```
+
+```bash
+# Inside sandbox
+STRIPE_SECRET_KEY=ftl_shadow_stripe_secret_key_7f8a2b3c
+OPENAI_API_KEY=ftl_shadow_openai_api_key_4d9e2a1f
+```
+
+The agent writes code using these values. Your real keys are never exposed.
+
+### Enable the Network Proxy
+
+For live API testing, install the credential-swap proxy:
+
+```bash
+pip install -e ".[proxy]"
+```
+
+The proxy intercepts outbound HTTP/HTTPS traffic and replaces shadow credentials with real values **at the network layer**:
+
+```
+Container sends:  Authorization: Bearer ftl_shadow_stripe_secret_key_7f8a2b3c
+Proxy rewrites:   Authorization: Bearer sk_live_abc123
+Stripe receives:  Authorization: Bearer sk_live_abc123  ✓
+```
+
+The agent never learns your real keys, even when making live API calls.
+
+### Use AWS Secrets Manager for Production
+
+For production workflows, use AWS Secrets Manager instead of `.env` files:
+
+```json
+{
+  "secrets_manager_prefix": "/myproject/prod/"
+}
+```
+
+Benefits:
+- Centralized secret storage with audit logs
+- Automatic rotation support
+- No secrets in Git (even in `.env.example`)
+- IAM-based access control
+
+FTL fetches secrets at session start, generates shadow values, and the rest of the workflow is identical.
+
+## Lint and Guardrail Configuration
+
+### Always Review Lint Violations
+
+The [credential linter](/security/credential-linting) scans for:
+- Hardcoded shadow credentials
+- Known API key patterns (Stripe, Anthropic, AWS, GitHub, etc.)
+- Dangerous SQL operations (DROP, DELETE without WHERE)
+- Dangerous shell commands (rm -rf, chmod 777)
+
+Violations are **advisory**, but you should fix them before merging:
+
+```python
+# BAD: hardcoded credential
+api_key = "ftl_shadow_stripe_secret_key_7f8a2b3c"
+
+# GOOD: read from environment
+import os
+api_key = os.environ["STRIPE_SECRET_KEY"]
+```
+
+<Warning>
+If the agent hardcodes a shadow credential, the code will break outside the sandbox. Always ensure credentials are loaded from environment variables.
+</Warning>
+
+### Use Bedrock Guardrails for Hard Enforcement
+
+For critical projects, configure [Bedrock Guardrails](/security/guardrails) to **block merges** on violations:
+
+```bash
+ftl config --aws
+```
+
+This creates a guardrail with:
+- PII detection (email, phone, SSN, credit cards)
+- Credential pattern blocking (API keys, tokens)
+- Content policy filtering (optional)
+
+Unlike the linter, guardrail violations **prevent merge** — you must fix them and re-run the task.
+
+## Sandbox Isolation
+
+### Never Mount Host Directories
+
+FTL uses rsync to copy your project into the sandbox. **Never** mount your host filesystem directly into the container:
+
+```bash
+# NEVER DO THIS
+docker run -v /path/to/project:/workspace ...
+```
+
+Mounting the host filesystem defeats the isolation layer. The agent could modify files outside the snapshot and bypass diff review.
+
+### Restrict Agent Environment Variables
+
+By default, FTL only forwards credentials and variables explicitly listed in `agent_env`:
+
+```json
+{
+  "shadow_env": ["STRIPE_SECRET_KEY", "OPENAI_API_KEY"],
+  "agent_env": ["NODE_ENV", "DEBUG"]
+}
+```
+
+- `shadow_env` — credentials to replace with shadow values
+- `agent_env` — non-sensitive variables to forward as-is
+
+**Do not** add sensitive data to `agent_env`. Use `shadow_env` instead.
+
+### Review Container Persistence
+
+FTL uses **persistent containers** to avoid cold-boot penalties. Understand what persists across tasks:
+
+| Location | Persistence | Risk |
+|----------|-------------|------|
+| `/workspace/` | Wiped per task | Low — always restored from snapshot |
+| `/home/ftl/.local/` | Persists | Medium — agent-installed packages |
+| `/home/ftl/.claude/` | Persists | Low — conversation history |
+
+If you suspect the container is compromised:
+
+```bash
+# Remove the persistent container
+docker ps -a | grep ftl
+docker rm -f <container-id>
+
+# Next ftl code run will create a fresh container
+```
+
+## Code Review
+
+### Always Review the Diff
+
+FTL blocks automatic merges. You must:
+
+1. Review the diff line-by-line
+2. Ask the agent questions about suspicious changes
+3. Explicitly approve (`a`) or reject (`r`)
+
+Do not blindly approve large diffs:
+
+```bash
+Review changes:
+  a — approve and merge
+  r — reject and discard
+  <question> — ask about the diff
+
+> why does this delete the error handler?
+```
+
+The agent will explain its reasoning. If the answer is unsatisfactory, reject the changes.
+
+### Verify Dangerous Operations
+
+The linter flags destructive operations, but you must verify they're intentional:
+
+```sql
+-- Flagged: Dangerous SQL: DROP TABLE
+DROP TABLE old_users;
+```
+
+Questions to ask:
+- Is this part of a migration?
+- Is there a backup?
+- Should this have a `WHERE` clause or condition?
+
+### Check for Logic Errors
+
+The linter only detects **patterns**, not logic errors. Review for:
+- Missing null checks
+- Incorrect error handling
+- Race conditions
+- Authentication bypasses
+
+## AWS Configuration Security
+
+### Use Least-Privilege IAM
+
+If you use AWS features (S3 snapshots, Secrets Manager, Guardrails), create a dedicated IAM user with minimal permissions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::ftl-<account>-<region>",
+        "arn:aws:s3:::ftl-<account>-<region>/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:*:*:secret:/myproject/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "bedrock:ApplyGuardrail",
+      "Resource": "arn:aws:bedrock:*:*:guardrail/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "logs:PutLogEvents",
+      "Resource": "arn:aws:logs:*:*:log-group:/ftl/*"
+    }
+  ]
+}
+```
+
+### Enable CloudWatch Tracing
+
+For audit trails, enable CloudWatch logging:
+
+```json
+{
+  "cloudwatch_log_group": "/ftl/myproject"
+}
+```
+
+FTL emits structured JSON events for:
+- Snapshot creation
+- Container boot
+- Agent execution
+- Test results
+- Guardrail decisions
+
+Use these logs to detect anomalies or compliance violations.
+
+## Handling Secrets in Code
+
+### Never Commit .env Files
+
+Add `.env` to `.gitignore` and `.ftlignore`:
+
+```
+# .gitignore
+.env
+.env.*
+!.env.example
+```
+
+Provide a template for other developers:
+
+```bash
+# .env.example
+STRIPE_SECRET_KEY=sk_test_...
+OPENAI_API_KEY=sk-...
+```
+
+### Use Environment Variables Everywhere
+
+Train the agent to always use environment variables:
+
+```bash
+ftl code 'create Stripe payment module using process.env.STRIPE_SECRET_KEY'
+```
+
+If the agent hardcodes a credential, reject the changes and re-prompt:
+
+```bash
+ftl code 'rewrite payment.js to load STRIPE_SECRET_KEY from process.env'
+```
+
+### Rotate Credentials Periodically
+
+Even with FTL's protections, rotate credentials on a regular schedule:
+
+1. Generate new keys in your service provider's dashboard
+2. Update `.env` or Secrets Manager
+3. Revoke old keys
+
+FTL's shadow credential system means you can rotate freely without updating any code.
+
+## Incident Response
+
+### If a Credential Leaks
+
+1. **Revoke the credential immediately** in your service provider's dashboard
+2. Check the diff for how it was exposed (hardcoded vs logged)
+3. Review CloudWatch logs or `~/.ftl/logs.jsonl` for the full session
+4. Rotate all related credentials
+5. Update `.ftlconfig` to add the credential to `shadow_env` if it wasn't already
+
+### If the Container is Compromised
+
+1. **Stop and remove the container**:
+   ```bash
+   docker ps -a | grep ftl
+   docker rm -f <container-id>
+   ```
+2. Check recent snapshots for malicious code:
+   ```bash
+   ftl snapshots
+   ```
+3. Review session logs:
+   ```bash
+   ftl logs --all
+   ```
+4. Next `ftl code` run will create a fresh container
+
+## Summary Checklist
+
+- [ ] Real credentials are in `.env` (or Secrets Manager), never in code
+- [ ] `.env` is in `.gitignore` and `.ftlignore`
+- [ ] Credential-swap proxy is installed (`pip install -e ".[proxy]"`)
+- [ ] Bedrock Guardrails are configured for critical projects
+- [ ] CloudWatch logging is enabled for audit trails
+- [ ] IAM permissions follow least-privilege principle
+- [ ] All diffs are reviewed line-by-line before merge
+- [ ] Lint violations are fixed, not ignored
+- [ ] Credentials are rotated on a regular schedule
+- [ ] Incident response plan is documented
+
+FTL provides the tools — security requires human judgment. Always review agent output critically.

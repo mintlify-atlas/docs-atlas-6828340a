@@ -1,0 +1,199 @@
+---
+title: Bedrock Guardrails
+description: AWS Bedrock Guardrails integration for hard-blocking credential and PII detection
+---
+
+FTL integrates with [AWS Bedrock Guardrails](https://aws.amazon.com/bedrock/guardrails/) to provide **hard-blocking enforcement** of credential and sensitive data policies. When configured, guardrails replace the local [credential linter](/security/credential-linting) and prevent merges if violations are detected.
+
+## How It Works
+
+When `guardrail_id` is set in `.ftlconfig`, FTL applies the guardrail to the full diff text before the human review step:
+
+1. Agent finishes making changes
+2. FTL computes the diff
+3. **Guardrail is applied to the entire diff text**
+4. If the guardrail **intervenes** (detects a violation):
+   - Findings are displayed (PII type, content policy, regex matches)
+   - Merge is **hard-blocked**
+   - All changes are discarded
+5. If the guardrail **passes**:
+   - Review proceeds normally
+   - You can approve or reject the changes
+
+<Warning>
+Unlike the local linter, guardrail violations are **not advisory**. If the guardrail intervenes, you cannot merge the changes. Fix the violations and re-run the task.
+</Warning>
+
+## Configuration
+
+Add `guardrail_id` and optionally `guardrail_version` to `.ftlconfig`:
+
+```json
+{
+  "agent": "claude-code",
+  "tester": "claude-haiku-4-5-20251001",
+  "guardrail_id": "abc123def456",
+  "guardrail_version": "1"
+}
+```
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `guardrail_id` | Yes | — | Bedrock Guardrail ID or ARN |
+| `guardrail_version` | No | `"DRAFT"` | Guardrail version to apply |
+
+### Using ftl config --aws
+
+The easiest way to set up guardrails is with the one-shot AWS wizard:
+
+```bash
+ftl config --aws
+```
+
+This command:
+1. Creates a Bedrock Guardrail named `ftl-<project-name>`
+2. Configures it with PII detection and credential blocking policies
+3. Adds `guardrail_id` and `guardrail_version` to `.ftlconfig`
+
+The wizard is **idempotent** — running it again will not duplicate resources.
+
+## Guardrail Policies
+
+The guardrail created by `ftl config --aws` includes:
+
+### Sensitive Information Policy
+
+Detects and blocks:
+- **PII entities**: email addresses, phone numbers, SSNs, credit card numbers, etc.
+- **Custom regex patterns**: API key formats, access tokens, other credential patterns
+
+When a PII entity or regex match is found, the action can be:
+- `BLOCKED` — reject the content
+- `ANONYMIZED` — redact the sensitive data (not used by FTL)
+
+### Content Policy
+
+Blocks harmful content categories:
+- Hate speech
+- Insults
+- Sexual content
+- Violence
+- Misconduct
+- Prompt attacks
+
+This is less relevant for code diffs but provides an additional safety layer.
+
+## Guardrail Output
+
+When the guardrail intervenes, FTL displays the findings:
+
+```
+Bedrock Guardrail: BLOCKED
+
+Findings:
+  - Sensitive info: EMAIL_ADDRESS
+  - Sensitive info: CREDIT_CARD
+  - Pattern match: stripe_live_key
+
+Merge blocked. Fix the violations and re-run the task.
+```
+
+The changes are **automatically rejected** — you cannot proceed to review.
+
+## Guardrail API
+
+FTL calls the Bedrock Guardrails API via `boto3`:
+
+```python
+import boto3
+
+client = boto3.client("bedrock-runtime")
+response = client.apply_guardrail(
+    guardrailIdentifier=guardrail_id,
+    guardrailVersion=guardrail_version or "DRAFT",
+    source="OUTPUT",
+    content=[{"text": {"text": diff_text}}],
+)
+```
+
+The `source="OUTPUT"` parameter tells Bedrock to treat the content as agent-generated output, not user input.
+
+### Response Format
+
+The API returns:
+- `action` — `"GUARDRAIL_INTERVENED"` or `"NONE"`
+- `assessments` — list of policy violations
+
+FTL parses the assessments to extract:
+1. **PII entities** — type (e.g., `EMAIL_ADDRESS`, `CREDIT_CARD`)
+2. **Regex matches** — custom pattern name
+3. **Content policy filters** — violation type (e.g., `HATE`, `VIOLENCE`)
+
+## When to Use Guardrails
+
+Use Bedrock Guardrails when:
+- You need **hard enforcement** of credential policies (local linter is advisory)
+- You're working with sensitive data (PII, PHI, financial records)
+- You want centralized policy management across multiple projects
+- You need audit trails for compliance (CloudWatch logs every guardrail call)
+
+Use the [local linter](/security/credential-linting) when:
+- You want advisory warnings without blocking merge
+- You're working in a region without Bedrock support
+- You want to avoid AWS API costs (guardrails are billed per request)
+
+## Permissions
+
+Your AWS credentials need `bedrock:ApplyGuardrail` permission:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "bedrock:ApplyGuardrail",
+      "Resource": "arn:aws:bedrock:*:*:guardrail/*"
+    }
+  ]
+}
+```
+
+The `ftl config --aws` wizard also requires `bedrock:CreateGuardrail` to provision the guardrail.
+
+## Error Handling
+
+If the guardrail API call fails (network error, missing permissions, invalid guardrail ID), FTL falls back to **non-blocking mode**:
+
+```python
+try:
+    response = client.apply_guardrail(...)
+except Exception:
+    return False, []  # No block, no findings
+```
+
+This prevents transient AWS issues from breaking your workflow. However, you should monitor for errors and fix permission issues promptly.
+
+<Warning>
+If the guardrail API is unreachable, FTL will not block merges. Check your AWS credentials and network connectivity.
+</Warning>
+
+## Implementation Details
+
+The guardrail integration is implemented in `ftl/guardrails.py`:
+
+```python
+def apply_guardrail(guardrail_id, guardrail_version, text):
+    """Apply a Bedrock Guardrail to arbitrary text.
+    
+    Returns (blocked: bool, findings: list[str]). Never raises.
+    """
+```
+
+Key behavior:
+- Returns `(False, [])` if `guardrail_id` or `text` is empty
+- Never raises exceptions — always returns a tuple
+- Parses PII entities, regex matches, and content policy filters from the response
+- Uses `source="OUTPUT"` to indicate agent-generated content
+
+The function is called from `ftl/orchestrator.py` during the merge review phase, before the interactive diff is shown.

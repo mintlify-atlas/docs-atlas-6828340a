@@ -1,0 +1,206 @@
+---
+title: "Welcome to FTL"
+description: "Zero-trust control plane for AI coding agents"
+---
+
+<img
+  className="block dark:hidden"
+  src="/images/hero-light.svg"
+  alt="FTL Hero Light"
+/>
+<img
+  className="hidden dark:block"
+  src="/images/hero-dark.svg"
+  alt="FTL Hero Dark"
+/>
+
+## What is FTL?
+
+FTL is a **zero-trust control plane for AI coding agents**. Run Claude Code, Codex, Aider, or Kiro inside an isolated Docker sandbox with shadow credentials, parallel adversarial testing, and human-in-the-loop approval — without ever giving the agent access to your real secrets or filesystem.
+
+<CardGroup cols={2}>
+  <Card
+    title="Quickstart"
+    icon="rocket"
+    href="/quickstart"
+  >
+    Get up and running with FTL in under 5 minutes
+  </Card>
+  <Card
+    title="Installation"
+    icon="download"
+    href="/installation"
+  >
+    Detailed installation and setup instructions
+  </Card>
+  <Card
+    title="How it works"
+    icon="gears"
+    href="/concepts/how-it-works"
+  >
+    Learn about FTL's architecture and security model
+  </Card>
+  <Card
+    title="CLI reference"
+    icon="terminal"
+    href="/cli/setup"
+  >
+    Complete command-line interface documentation
+  </Card>
+</CardGroup>
+
+## Why FTL?
+
+AI coding agents are powerful but untrustworthy by construction. FTL provides the safety layer that makes them practical:
+
+<CardGroup cols={3}>
+  <Card title="Isolated execution" icon="box">
+    Agents run in Docker containers with no access to your host filesystem or real credentials
+  </Card>
+  <Card title="Shadow credentials" icon="shield-halved">
+    Your real API keys never enter the sandbox — agents work with safe placeholder values
+  </Card>
+  <Card title="Human approval" icon="user-check">
+    Every change requires explicit review before touching your project
+  </Card>
+  <Card title="Adversarial testing" icon="vial">
+    Tests generate in parallel while the agent codes, catching issues immediately
+  </Card>
+  <Card title="Credential linting" icon="magnifying-glass">
+    Automatic scanning for leaked secrets and dangerous operations
+  </Card>
+  <Card title="Multi-agent support" icon="users">
+    Works with Claude Code, Codex, Aider, and Kiro
+  </Card>
+</CardGroup>
+
+## How it works
+
+When you run a task, FTL executes an 8-stage pipeline:
+
+```bash
+ftl code "build login component with Supabase auth"
+```
+
+<Steps>
+  <Step title="Snapshot">
+    Rsync your project state to `~/.ftl/snapshots/<id>`
+  </Step>
+  <Step title="Boot">
+    Reuse a persistent container or start fresh (per project)
+  </Step>
+  <Step title="Inject">
+    Shadow credentials replace real keys inside the sandbox
+  </Step>
+  <Step title="Agent ∥ Tests">
+    The coding agent runs while adversarial tests generate in parallel
+  </Step>
+  <Step title="Run tests">
+    Pre-generated tests execute the moment the agent finishes
+  </Step>
+  <Step title="Lint">
+    Diff scanned for credentials and dangerous operations
+  </Step>
+  <Step title="Diff">
+    Computed on demand; file-level review of all changes
+  </Step>
+  <Step title="Approve">
+    You review, ask questions, and merge or reject
+  </Step>
+</Steps>
+
+<Note>
+  The agent runs entirely inside Docker. It never sees your real API keys or your host filesystem. Nothing touches your project without explicit approval.
+</Note>
+
+## Key features
+
+<AccordionGroup>
+  <Accordion icon="shield" title="Zero-trust security model">
+    FTL operates on the principle that agents are untrustworthy by construction. Every layer is designed to prevent credential leaks and unauthorized filesystem access:
+    
+    - Shadow credentials generated for each session
+    - Optional network proxy that swaps shadow values for real ones at the HTTP layer
+    - Bedrock Guardrails integration for hard-blocking merges with detected secrets
+  </Accordion>
+
+  <Accordion icon="bolt" title="Parallel test generation">
+    While your agent writes code, FTL simultaneously generates adversarial tests using your chosen LLM model:
+    
+    - No wall-clock time added — tests run immediately when the agent finishes
+    - Supports Anthropic, AWS Bedrock, and OpenAI via LiteLLM
+    - Manual test re-runs available in interactive mode
+  </Accordion>
+
+  <Accordion icon="layer-group" title="Persistent containers">
+    FTL maintains one container per project path to eliminate cold-start overhead:
+    
+    - Workspace wiped and restored from snapshot on each task
+    - Installed packages persist in `/home/ftl/.local/`
+    - Agent conversation history preserved across tasks
+    - Node.js pre-warmed in background during boot
+  </Accordion>
+
+  <Accordion icon="aws" title="AWS integration">
+    Optional AWS-backed capabilities for production use:
+    
+    - S3 snapshot storage
+    - CloudWatch session tracing
+    - Secrets Manager for credential management
+    - Bedrock Guardrails for diff safety
+  </Accordion>
+</AccordionGroup>
+
+## Supported agents
+
+FTL works with four popular AI coding agents:
+
+| Agent | Key | Requires |
+|---|---|---|
+| Claude Code | `claude-code` | `ANTHROPIC_API_KEY` |
+| Codex | `codex` | `OPENAI_API_KEY` |
+| Aider | `aider` | `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` |
+| Kiro | `kiro` | AWS credentials + browser login |
+
+<Card title="Learn more about agents" icon="robot" href="/guides/agents">
+  See detailed configuration and authentication for each agent
+</Card>
+
+## Philosophy
+
+> Agents are untrustworthy by construction. FTL is the layer that makes them safe to use anyway.
+
+The agent cannot have skin in the game. The human must. Every change requires explicit approval before it touches the real filesystem.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Run your first task"
+    icon="play"
+    href="/quickstart"
+  >
+    Complete the 5-minute quickstart guide
+  </Card>
+  <Card
+    title="Configure for production"
+    icon="gear"
+    href="/guides/aws-setup"
+  >
+    Set up AWS integration for S3, CloudWatch, and Guardrails
+  </Card>
+  <Card
+    title="Interactive shell"
+    icon="terminal"
+    href="/guides/interactive-shell"
+  >
+    Learn about follow-up instructions and session management
+  </Card>
+  <Card
+    title="Shadow credentials"
+    icon="key"
+    href="/concepts/shadow-credentials"
+  >
+    Deep dive into credential security
+  </Card>
+</CardGroup>

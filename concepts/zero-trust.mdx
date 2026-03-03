@@ -1,0 +1,304 @@
+---
+title: Zero-trust architecture
+description: How FTL isolates agent execution without trusting the agent
+---
+
+FTL treats AI coding agents as untrustworthy by construction. The agent never sees your real API keys, never touches your host filesystem, and cannot merge changes without explicit human approval.
+
+## Isolation layers
+
+FTL enforces zero-trust through multiple isolation mechanisms working together:
+
+### 1. Docker sandbox
+
+The agent runs entirely inside a Docker container. Your real project files never enter the container — instead, FTL creates a snapshot and mounts it read-only:
+
+```python
+# From sandbox/docker.py:301-318
+def _create(self):
+    snapshots_dir = str((Path.home() / ".ftl" / "snapshots").resolve())
+    Path(snapshots_dir).mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "docker", "run", "-d",
+        "--network=bridge",
+        "--add-host=host.docker.internal:host-gateway",
+        "--memory=2g",
+        "--cpus=2",
+        "-v", f"{snapshots_dir}:/mnt/snapshots:ro",
+        "-w", "/workspace",
+        IMAGE,
+        "sleep", "infinity",
+    ]
+```
+
+<Note>
+  The `:ro` flag ensures snapshots are read-only. The agent can only modify `/workspace`, which is wiped on every task reset.
+</Note>
+
+Containers are resource-constrained:
+- **Memory:** 2GB
+- **CPU:** 2 cores
+- **Network:** Bridge mode with host gateway for proxy access
+
+### 2. Shadow credentials
+
+Your real API keys never enter the container. FTL generates fake shadow values and injects them as environment variables:
+
+```python
+# From credentials.py:64-68
+def generate_shadow_key(name):
+    """Generate a recognizable shadow key for a credential."""
+    token = secrets.token_hex(8)
+    return f"{SHADOW_PREFIX}{name.lower()}_{token}"
+```
+
+**Example transformation:**
+
+```
+# Your .env (never enters container)
+STRIPE_SECRET_KEY=sk_live_abc123
+OPENAI_API_KEY=sk-proj-xyz789
+
+# Agent sees inside container
+STRIPE_SECRET_KEY=ftl_shadow_stripe_secret_key_7f8a2b3c
+OPENAI_API_KEY=ftl_shadow_openai_api_key_4d9e2a1f
+```
+
+The agent writes code using these shadow values. Before merge, FTL's lint scanner detects any hardcoded shadow patterns:
+
+```python
+# From lint.py:13-14, 96-100
+SHADOW_PATTERN = re.compile(r"ftl_shadow_\w+_[0-9a-f]{16}")
+
+if SHADOW_PATTERN.search(content):
+    violations.append(LintViolation(
+        path, line_num, content,
+        "Hardcoded shadow credential value"
+    ))
+```
+
+<Warning>
+  Shadow credentials are **not** a substitute for read-only API keys. They prevent accidental leaks, but the agent can still use them to make API calls if the proxy is enabled.
+</Warning>
+
+### 3. Network proxy (optional)
+
+When the proxy is enabled, shadow credentials are swapped back to real values at the network layer:
+
+```python
+# From proxy.py:135-140
+def _swap(self, data: bytes) -> bytes:
+    """Replace shadow credential bytes with real credential bytes."""
+    for shadow, real in self.server.swap_table.items():
+        if shadow.encode() in data:
+            data = data.replace(shadow.encode(), real.encode())
+    return data
+```
+
+**Flow:**
+
+```
+Container sends:  Authorization: Bearer ftl_shadow_stripe_secret_key_7f8a2b3c
+Proxy rewrites:   Authorization: Bearer sk_live_abc123
+Stripe receives:  Authorization: Bearer sk_live_abc123  ✓
+```
+
+The proxy handles both HTTP and HTTPS via MITM with an ephemeral CA:
+
+```python
+# From proxy.py:45-74 (simplified)
+def _generate_ca():
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "FTL Proxy CA"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "FTL"),
+    ])
+    now = datetime.now(timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .not_valid_before(now)
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+```
+
+The CA is installed in the container's trust store before the agent runs:
+
+```python
+# From proxy.py:377-395
+def install_ca_in_container(self, sandbox):
+    import base64
+    cert_b64 = base64.b64encode(self.ca_cert_pem).decode()
+    cmds = (
+        # System CA store (curl, Python requests, etc.)
+        f"echo '{cert_b64}' | base64 -d"
+        f" > /usr/local/share/ca-certificates/ftl-proxy.crt"
+        f" && update-ca-certificates -q"
+        # Node.js CA file (Claude Code, any other Node apps)
+        f" && echo '{cert_b64}' | base64 -d > /tmp/ftl-proxy-ca.crt"
+    )
+    sandbox.exec_as_root(cmds)
+```
+
+<Info>
+  The proxy is optional. Install with `pip install -e ".[proxy]"`. Without it, the agent can only use shadow values — live API calls will fail unless you use test/sandbox API keys.
+</Info>
+
+### 4. Human-in-the-loop approval
+
+No changes touch your real filesystem without explicit approval. After the agent finishes, FTL shows you a diff and waits for your decision:
+
+```python
+# From orchestrator.py:359-383 (simplified)
+approved = review_diff(diffs, planner_model)
+if approved:
+    self.console.print("[bold green]Approved. Merging changes...[/bold green]")
+    _merge_changes(diffs, self.workspace, self.project_path)
+    self.console.print("  Changes merged to project.")
+else:
+    self.console.print("[bold red]Rejected. Changes discarded.[/bold red]")
+```
+
+**Merge process:**
+
+```python
+# From orchestrator.py:71-93
+def _merge_changes(diffs, workspace, project_path):
+    workspace = Path(workspace)
+    project = Path(project_path)
+
+    for diff in diffs:
+        rel = Path(diff["path"])
+        if diff["status"] in ("created", "modified"):
+            dest = project / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if "_content_bytes" in diff:
+                dest.write_bytes(diff["_content_bytes"])
+            else:
+                src = workspace / rel
+                shutil.copy2(src, dest)
+        elif diff["status"] == "deleted":
+            target = project / rel
+            if target.exists():
+                target.unlink()
+```
+
+Only the changed files are copied back. FTL uses the diff as the merge source, not a full directory sync.
+
+## Guardrails
+
+### Local lint scanner
+
+By default, FTL runs a static analysis pass over the diff before showing the review prompt:
+
+```python
+# From lint.py:16-27 (simplified)
+CREDENTIAL_PATTERNS = [
+    re.compile(r"""['\"]sk_live_[A-Za-z0-9]{20,}['\"]"""        # Stripe live
+    re.compile(r"""['\"]sk_test_[A-Za-z0-9]{20,}['\"]"""        # Stripe test
+    re.compile(r"""['\"]sk-ant-[A-Za-z0-9_\-]{20,}['\"]"""     # Anthropic
+    re.compile(r"""['\"]AKIA[A-Z0-9]{16}['\"]"""                # AWS access key
+    re.compile(r"""['\"]ghp_[A-Za-z0-9]{36,}['\"]"""            # GitHub PAT
+    re.compile(r"""['\"]xoxb-[A-Za-z0-9\-]{20,}['\"]"""        # Slack bot
+    # ...
+]
+```
+
+Violations are displayed with file path and line number, but they're **advisory only** — you can still approve the merge.
+
+### Bedrock Guardrails (AWS mode)
+
+When `guardrail_id` is set in `.ftlconfig`, FTL applies a Bedrock Guardrail to the full diff text before the human review step:
+
+```python
+# From orchestrator.py:329-346
+guardrail_id = self.config.get("guardrail_id", "")
+if guardrail_id:
+    from ftl.guardrails import apply_guardrail
+    from ftl.diff import diff_to_text
+    blocked, gr_findings = apply_guardrail(
+        guardrail_id,
+        self.config.get("guardrail_version", "DRAFT"),
+        diff_to_text(diffs),
+    )
+    if gr_findings:
+        self.console.print("[bold red]Bedrock Guardrail findings:[/bold red]")
+        for f in gr_findings:
+            self.console.print(f"  [red]• {f}[/red]")
+    if blocked:
+        self.console.print("[bold red]Guardrail blocked merge. Changes discarded.[/bold red]")
+        self._cleanup()
+        return
+```
+
+<Warning>
+  Bedrock Guardrails **hard-blocks** the merge. If credentials or PII are detected, changes are discarded automatically with no review option.
+</Warning>
+
+## Agent authentication
+
+The agent needs its own API key to make LLM calls (e.g., Claude Code needs `ANTHROPIC_API_KEY`). FTL forwards these from the host environment:
+
+```python
+# From orchestrator.py:44-50
+AGENT_AUTH_VARS = {
+    "claude-code": ["ANTHROPIC_API_KEY"],
+    "kiro": ["KIRO_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION"],
+    "codex": ["OPENAI_API_KEY"],
+    "aider": ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"],  # model-dependent
+}
+```
+
+These are written to a file inside the container and sourced before agent commands:
+
+```python
+# From sandbox/docker.py:196-206
+all_env = {**self._credentials, **self._agent_env}
+if all_env:
+    env_lines = "\n".join(f"export {k}='{v}'" for k, v in all_env.items())
+    subprocess.run(
+        ["docker", "exec", self.container_id, "sh", "-c",
+         f"cat > {ENV_FILE} << 'FTLEOF'\n{env_lines}\nFTLEOF"],
+        capture_output=True,
+    )
+```
+
+<Info>
+  Agent auth keys are separate from project secrets. The agent's `ANTHROPIC_API_KEY` is for making LLM calls. Shadow credentials are for the agent's generated code to call external APIs.
+</Info>
+
+## Rollback and snapshots
+
+Every task creates a snapshot before the agent runs. If you reject changes, the snapshot remains available:
+
+```bash
+ftl snapshots                     # list snapshots for current project
+ftl snapshots --all               # list all snapshots
+ftl snapshots clean --last 10     # delete 10 most recent
+```
+
+Snapshots are stored in `~/.ftl/snapshots/<id>/` by default, or S3 when `"snapshot_backend": "s3"` is configured.
+
+## Threat model
+
+FTL defends against:
+
+- **Credential leaks:** Agent writes `STRIPE_SECRET_KEY=sk_live_...` to a config file
+- **Filesystem access:** Agent tries to read `~/.ssh/id_rsa` or modify files outside `/workspace`
+- **Resource exhaustion:** Agent spawns infinite loops or forkbombs (constrained by Docker memory/CPU limits)
+- **Accidental destructive operations:** Agent runs `rm -rf /` or `DROP DATABASE production`
+
+FTL does **not** defend against:
+
+- **Intentional misuse of live API calls:** If the proxy is enabled and you approve code that calls `stripe.charges.create()` with real keys, the charge will go through
+- **Social engineering:** The agent can write code that looks safe but contains logic bombs triggered later
+- **Supply chain attacks:** If the agent's dependencies (Claude Code, Aider, etc.) are compromised, FTL cannot detect it
+
+<Warning>
+  FTL is not a substitute for code review. Always inspect the diff before approving, especially when the agent has access to production API keys via the proxy.
+</Warning>

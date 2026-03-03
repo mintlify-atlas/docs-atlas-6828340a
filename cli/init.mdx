@@ -1,0 +1,75 @@
+---
+title: ftl init
+description: Initialize FTL in the current project by creating a .ftlconfig file with default settings
+---
+
+## Overview
+
+The `ftl init` command creates a `.ftlconfig` file in the current directory, initializing FTL for your project. This file stores project-specific configuration and must exist before you can run coding tasks.
+
+## Usage
+
+```bash
+ftl init
+```
+
+## Behavior
+
+When you run `ftl init`:
+
+- Creates a `.ftlconfig` file in the current directory with default settings
+- If `.ftlconfig` already exists, prints a message and exits without making changes
+- The config file is required for running `ftl code` and other commands
+
+## Example
+
+```bash
+$ cd my-project
+$ ftl init
+Created /home/user/my-project/.ftlconfig
+```
+
+If you run it again in the same directory:
+
+```bash
+$ ftl init
+.ftlconfig already exists.
+```
+
+## What Gets Created
+
+The `.ftlconfig` file contains project-specific settings that control:
+
+- Which AI agent to use (inherited from global config)
+- Which tester model to use for test generation
+- Snapshot backend configuration (local or S3)
+- AWS integration settings (optional)
+
+## Global vs Project Config
+
+FTL uses a two-level configuration system:
+
+- **Global config** (`~/.ftl/config.json`) - Set by `ftl setup`, stores agent and tester defaults
+- **Project config** (`.ftlconfig`) - Created by `ftl init`, can override global settings
+
+Project settings take precedence over global settings.
+
+## Next Steps
+
+After running `ftl init`:
+
+1. Run `ftl code "your task"` to start a coding session
+2. Optionally run `ftl config --aws` to enable AWS features
+
+## Required Before
+
+Before running `ftl init`, you should:
+
+1. Run `ftl setup` to configure your agent and API credentials
+2. Navigate to your project directory
+
+## See Also
+
+- [ftl setup](/cli/setup) - Initial FTL setup wizard
+- [ftl code](/cli/code) - Run a coding task
+- [ftl config](/cli/config) - Configure AWS integration

@@ -1,0 +1,348 @@
+---
+title: Agent Adapter Architecture
+description: Abstract agent interface and implementation details
+---
+
+FTL supports multiple coding agents through a unified adapter interface. All agents execute **inside the Docker sandbox** — they never touch the host filesystem directly.
+
+## Agent Interface
+
+The abstract base class defines the contract all agents must implement:
+
+```python
+from abc import ABC, abstractmethod
+
+class Agent(ABC):
+    """Base interface for coding agent adapters.
+
+    Agents run INSIDE the sandbox. All commands execute via sandbox.exec() or
+    sandbox.exec_stream() (when a streaming callback is provided).
+    """
+
+    @abstractmethod
+    def run(self, task, workspace, sandbox, callback=None):
+        """Run a task inside the sandbox (first message).
+        
+        Returns (exit_code, stdout, stderr).
+        If callback is provided, output is streamed line-by-line through it.
+        """
+        pass
+
+    @abstractmethod
+    def continue_run(self, task, workspace, sandbox, callback=None):
+        """Continue a conversation with the agent (follow-up message).
+
+        Returns (exit_code, stdout, stderr).
+        If callback is provided, output is streamed line-by-line through it.
+        """
+        pass
+```
+
+**Key design points:**
+
+1. **Sandbox execution** — Agents invoke CLI tools inside the container via `sandbox.exec()` or `sandbox.exec_stream()`
+2. **Streaming support** — Optional `callback` enables line-by-line output rendering
+3. **Conversation state** — `run()` starts a new task; `continue_run()` sends follow-up messages
+4. **Return values** — All methods return `(exit_code, stdout, stderr)` matching subprocess conventions
+
+<Info>
+Agents never have direct filesystem access. They operate exclusively through commands executed inside the sandbox.
+</Info>
+
+## Supported Agents
+
+FTL ships with four agent adapters:
+
+| Agent | CLI | Key | Docker Image |
+|-------|-----|-----|-------------|
+| Claude Code | `claude` | `ANTHROPIC_API_KEY` | `vvenne/ftl:latest` |
+| Codex | `codex` | `OPENAI_API_KEY` | `vvenne/ftl:codex` |
+| Aider | `aider` | `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` | `vvenne/ftl:aider` |
+| Kiro | `kiro-cli` | AWS credentials | `vvenne/ftl:kiro` |
+
+### Agent Registry (`agents/__init__.py`)
+
+```python
+from ftl.agents.claude_code import ClaudeCodeAgent
+from ftl.agents.kiro import KiroAgent
+from ftl.agents.codex import CodexAgent
+from ftl.agents.aider import AiderAgent
+
+AGENTS = {
+    "claude-code": ClaudeCodeAgent,
+    "kiro": KiroAgent,
+    "codex": CodexAgent,
+    "aider": AiderAgent,
+}
+
+def get_agent(name):
+    if name not in AGENTS:
+        raise ValueError(f"Unknown agent: {name}. Available: {list(AGENTS.keys())}")
+    return AGENTS[name]()
+```
+
+The orchestrator calls `get_agent(agent_name)` to instantiate the configured adapter.
+
+## Claude Code Adapter
+
+The default agent, optimized for streaming output and tool visibility.
+
+**Source:** `agents/claude_code.py:1-24`
+
+```python
+import shlex
+from ftl.agents.base import Agent
+
+_FLAGS = "--output-format stream-json --verbose --dangerously-skip-permissions"
+
+class ClaudeCodeAgent(Agent):
+
+    def run(self, task, workspace, sandbox, callback=None):
+        escaped = shlex.quote(task)
+        if callback is not None:
+            cmd = f"cd {workspace} && claude -p {escaped} {_FLAGS}"
+            return sandbox.exec_stream(cmd, callback=callback, timeout=3600)
+        cmd = f"cd {workspace} && claude -p {escaped} --dangerously-skip-permissions"
+        return sandbox.exec(cmd, timeout=3600)
+
+    def continue_run(self, task, workspace, sandbox, callback=None):
+        escaped = shlex.quote(task)
+        if callback is not None:
+            cmd = f"cd {workspace} && claude -p {escaped} -c {_FLAGS}"
+            return sandbox.exec_stream(cmd, callback=callback, timeout=3600)
+        cmd = f"cd {workspace} && claude -p {escaped} -c --dangerously-skip-permissions"
+        return sandbox.exec(cmd, timeout=3600)
+```
+
+**Flags:**
+- `--output-format stream-json` — Emits per-tool progress events that `AgentRenderer` parses
+- `--verbose` — Include tool details in output
+- `--dangerously-skip-permissions` — Allow all file operations without prompts
+- `-c` — Continue previous conversation (follow-up mode)
+
+**Streaming behavior:**
+```python
+if callback is not None:
+    return sandbox.exec_stream(cmd, callback=callback, timeout=3600)
+```
+
+When a callback is provided, output flows line-by-line through the renderer. Otherwise, execution blocks until completion.
+
+<Note>
+Claude Code's conversation history persists in `/home/ftl/.claude/` inside the container, surviving across tasks.
+</Note>
+
+## Agent Authentication
+
+The orchestrator forwards agent-specific environment variables from the host into the container.
+
+**Agent key mapping** (`orchestrator.py:44-56`):
+```python
+AGENT_AUTH_VARS = {
+    "claude-code": ["ANTHROPIC_API_KEY"],
+    "kiro": ["KIRO_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION"],
+    "codex": ["OPENAI_API_KEY"],
+    "aider": ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"],
+}
+
+AGENT_REQUIRED_KEY = {
+    "claude-code": "ANTHROPIC_API_KEY",
+    "codex": "OPENAI_API_KEY",
+}
+```
+
+**Collection from host environment:**
+```python
+def _collect_agent_env(agent_name, config):
+    """Collect auth env vars for the agent from the host environment."""
+    env = {}
+    for key in AGENT_AUTH_VARS.get(agent_name, []):
+        if key in os.environ:
+            env[key] = os.environ[key]
+    for key in config.get("agent_env", []):
+        if key in os.environ:
+            env[key] = os.environ[key]
+    return env
+```
+
+**Pre-boot validation:**
+```python
+required_key = AGENT_REQUIRED_KEY.get(self.agent_name)
+if required_key and required_key not in agent_env:
+    self.console.print(
+        f"[bold red]{required_key} is not set.[/bold red]\n"
+        f"  Run: ftl auth {required_key} <your-key>"
+    )
+    raise SystemExit(1)
+```
+
+This fails fast before booting the sandbox if the agent won't be able to authenticate.
+
+## Environment Injection
+
+Agent environment variables are written to `/tmp/.ftl_env` inside the container:
+
+**Write env file** (`sandbox/docker.py:196-206`):
+```python
+all_env = {**self._credentials, **self._agent_env}
+if all_env:
+    env_lines = "\n".join(f"export {k}='{v}'" for k, v in all_env.items())
+    subprocess.run(
+        ["docker", "exec", self.container_id, "sh", "-c",
+         f"cat > {ENV_FILE} << 'FTLEOF'\n{env_lines}\nFTLEOF"],
+        capture_output=True,
+    )
+```
+
+**Source before commands** (`sandbox/docker.py:219-223`):
+```python
+def _with_env(self, cmd):
+    """Prepend ENV_FILE sourcing if any credentials/agent env are configured."""
+    if self._credentials or self._agent_env:
+        return f". {ENV_FILE} && {cmd}"
+    return cmd
+```
+
+Every `sandbox.exec()` or `sandbox.exec_stream()` call automatically sources this file, making both shadow credentials and agent auth keys available.
+
+## Streaming Output
+
+Agents that support structured output (like Claude Code's `stream-json`) enable live progress display.
+
+**Callback pattern:**
+```python
+def _stream(line):
+    heartbeat.stop()
+    renderer.feed(line)
+result = self.agent.run(task, "/workspace", self.sandbox, callback=_stream)
+```
+
+**Sandbox streaming implementation** (`sandbox/docker.py:239-261`):
+```python
+def exec_stream(self, command, callback=None, timeout=DEFAULT_TIMEOUT):
+    """Run a command inside the container, streaming output line-by-line.
+
+    Merges stderr into stdout so errors appear live. Accumulates full output
+    and returns (exit_code, stdout, stderr) matching the exec() interface.
+    """
+    proc = subprocess.Popen(
+        ["docker", "exec", self.container_id, "sh", "-c", self._with_env(command)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    lines = []
+    try:
+        for line in proc.stdout:
+            lines.append(line)
+            if callback:
+                callback(line)
+    except KeyboardInterrupt:
+        proc.terminate()
+        raise
+    proc.wait()
+    return proc.returncode, "".join(lines), ""
+```
+
+**Key behaviors:**
+- Stderr merged into stdout so errors stream live
+- Full output accumulated and returned
+- Ctrl+C terminates the container process
+
+## Timeout Handling
+
+All agent executions have a default 60-minute timeout:
+
+```python
+DEFAULT_TIMEOUT = 3600  # 60 minutes (matches agent timeout)
+
+def exec(self, command, timeout=DEFAULT_TIMEOUT):
+    try:
+        result = subprocess.run(
+            ["docker", "exec", self.container_id, "sh", "-c", self._with_env(command)],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, "", f"Command timed out after {timeout}s"
+```
+
+Exit code 124 indicates timeout, matching POSIX `timeout` command conventions.
+
+## Adding New Agents
+
+To integrate a new agent:
+
+1. **Create adapter class** in `ftl/agents/your_agent.py`:
+   ```python
+   from ftl.agents.base import Agent
+   
+   class YourAgent(Agent):
+       def run(self, task, workspace, sandbox, callback=None):
+           cmd = f"cd {workspace} && your-agent-cli {task}"
+           if callback:
+               return sandbox.exec_stream(cmd, callback=callback)
+           return sandbox.exec(cmd)
+       
+       def continue_run(self, task, workspace, sandbox, callback=None):
+           cmd = f"cd {workspace} && your-agent-cli --continue {task}"
+           if callback:
+               return sandbox.exec_stream(cmd, callback=callback)
+           return sandbox.exec(cmd)
+   ```
+
+2. **Register in `__init__.py`**:
+   ```python
+   from ftl.agents.your_agent import YourAgent
+   
+   AGENTS = {
+       ...,
+       "your-agent": YourAgent,
+   }
+   ```
+
+3. **Add auth keys to orchestrator**:
+   ```python
+   AGENT_AUTH_VARS = {
+       ...,
+       "your-agent": ["YOUR_AGENT_API_KEY"],
+   }
+   
+   AGENT_REQUIRED_KEY = {
+       ...,
+       "your-agent": "YOUR_AGENT_API_KEY",
+   }
+   ```
+
+4. **Build Docker image** with your agent's CLI installed
+
+5. **Test:**
+   ```bash
+   ftl init
+   # Edit .ftlconfig: {"agent": "your-agent"}
+   ftl auth YOUR_AGENT_API_KEY sk-...
+   ftl code "test task"
+   ```
+
+## Agent Comparison
+
+| Feature | Claude Code | Codex | Aider | Kiro |
+|---------|------------|-------|-------|------|
+| Streaming output | ✓ (stream-json) | ✗ | ✗ | ✓ |
+| Conversation history | ✓ | ✓ | ✓ | ✓ |
+| Tool visibility | ✓ | ✗ | ✗ | ✓ |
+| Multi-model | ✗ | ✗ | ✓ | ✗ |
+| Auth complexity | Simple | Simple | Model-dependent | AWS SSO |
+| License | Proprietary | Proprietary | Apache 2.0 | Proprietary |
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Session Orchestration" icon="gears" href="/architecture/orchestrator">
+    How agents are invoked in the session lifecycle
+  </Card>
+  <Card title="Sandbox Internals" icon="container-storage" href="/architecture/sandbox-internals">
+    Container execution environment and workspace management
+  </Card>
+</CardGroup>

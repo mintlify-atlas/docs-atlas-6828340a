@@ -1,0 +1,192 @@
+---
+title: ftl logs
+description: Show session audit log with task history, events, and results
+---
+
+## Overview
+
+The `ftl logs` command displays a session audit log showing the history of all FTL coding sessions. Each log entry captures the task description, event type, snapshot ID, and result (merged/rejected).
+
+## Usage
+
+```bash
+ftl logs [-n LIMIT] [--all]
+```
+
+## Options
+
+<ParamField path="-n, --limit" type="integer" default="20">
+  Number of log entries to show (most recent N entries)
+</ParamField>
+
+<ParamField path="--all" type="boolean" default="false">
+  Show logs for all projects instead of just the current project
+</ParamField>
+
+## Examples
+
+### View Recent Logs
+
+```bash
+$ ftl logs
+━━━━━━━━━━━━━━━━━━ Session Log ━━━━━━━━━━━━━━━━━━
+┏━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━┓
+┃ Time       ┃ Event    ┃ Task                   ┃ Snapshot   ┃ Result  ┃
+┡━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━┩
+│ 03-03 10:15│ complete │ create login component │ snap-abc123│ merged  │
+│ 03-03 14:22│ complete │ add user authentication│ snap-def456│ merged  │
+│ 03-03 16:45│ complete │ refactor auth service  │ snap-ghi789│ rejected│
+└────────────┴──────────┴────────────────────────┴────────────┴─────────┘
+```
+
+### Limit to 10 Entries
+
+```bash
+$ ftl logs -n 10
+━━━━━━━━━━━━━━━━━━ Session Log ━━━━━━━━━━━━━━━━━━
+┏━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━┓
+┃ Time       ┃ Event    ┃ Task                   ┃ Snapshot   ┃ Result  ┃
+┡━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━┩
+│ 03-03 16:45│ complete │ refactor auth service  │ snap-ghi789│ rejected│
+└────────────┴──────────┴────────────────────────┴────────────┴─────────┘
+```
+
+### View All Projects
+
+```bash
+$ ftl logs --all
+━━━━━━━━━━━━━━━━━━ Session Log ━━━━━━━━━━━━━━━━━━
+┏━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━┓
+┃ Time       ┃ Event    ┃ Task                   ┃ Snapshot   ┃ Result  ┃
+┡━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━┩
+│ 03-03 10:15│ complete │ create login component │ snap-abc123│ merged  │
+│ 03-03 12:30│ complete │ add API endpoint       │ snap-jkl012│ merged  │
+│ 03-03 14:22│ complete │ add user authentication│ snap-def456│ merged  │
+└────────────┴──────────┴────────────────────────┴────────────┴─────────┘
+```
+
+### No Logs Found
+
+```bash
+$ ftl logs
+No logs yet. Run a task first.
+```
+
+## Log Entry Fields
+
+### Time
+
+Timestamp when the session event occurred, formatted as `MM-DD HH:MM`.
+
+### Event
+
+The type of session event. Common values:
+- `complete` - Task completed successfully
+- `start` - Task started
+- `error` - Task encountered an error
+
+### Task
+
+The task description provided to `ftl code`. Truncated to 50 characters in the table.
+
+### Snapshot
+
+The snapshot ID created for this session. Use this ID with `ftl snapshots` or the FTL shell to restore changes.
+
+### Result
+
+What happened to the snapshot:
+- `merged` (green) - Changes were merged into the working directory
+- `rejected` (red) - Changes were rejected and discarded
+- Empty - Session still active or no decision made yet
+
+## Log Storage
+
+### Local Mode
+
+Logs are stored in `~/.ftl/sessions.log` as JSON lines:
+
+```json
+{"timestamp": "2026-03-03T10:15:00", "event": "complete", "task": "create login component", "snapshot": "snap-abc123", "result": "merged", "project": "/home/user/my-app"}
+```
+
+### AWS Mode
+
+When configured with `ftl config --aws`, logs are sent to CloudWatch Logs:
+
+```
+Log Group: /ftl/{project_name}
+Log Stream: sessions
+```
+
+## Filtering by Project
+
+By default, `ftl logs` shows only logs for the current project (detected via `.ftlconfig`). Use `--all` to see logs across all projects.
+
+## Use Cases
+
+### Review Recent Activity
+
+```bash
+ftl logs -n 5
+```
+
+Quickly see the last 5 tasks and their outcomes.
+
+### Audit Trail
+
+```bash
+ftl logs --all -n 100 > audit.txt
+```
+
+Export a comprehensive audit trail for compliance or review.
+
+### Find Snapshot ID
+
+```bash
+ftl logs | grep "login component"
+```
+
+Locate the snapshot ID for a specific task to restore it.
+
+### Track Rejection Rate
+
+```bash
+ftl logs --all | grep rejected
+```
+
+See which tasks were rejected to understand patterns.
+
+## Troubleshooting
+
+### No Logs File
+
+If you've never run `ftl code`, the log file won't exist:
+
+```bash
+$ ftl logs
+No logs yet. Run a task first.
+```
+
+Solution: Run your first task with `ftl code "your task"`.
+
+### Logs from Other Projects
+
+If you don't see expected logs, they might be filtered by project:
+
+```bash
+ftl logs --all
+```
+
+## Log Rotation
+
+FTL does not automatically rotate or clean up log files. To manage log size:
+
+- Manually truncate or archive `~/.ftl/sessions.log`
+- In AWS mode, configure CloudWatch log retention policies
+
+## See Also
+
+- [ftl code](/cli/code) - Run tasks that generate log entries
+- [ftl snapshots](/cli/snapshots) - View snapshots referenced in logs
+- [ftl config](/cli/config) - Configure CloudWatch logging

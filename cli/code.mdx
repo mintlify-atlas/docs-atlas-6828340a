@@ -1,0 +1,104 @@
+---
+title: ftl code
+description: Run a coding task in an isolated Docker sandbox with AI assistance
+---
+
+## Overview
+
+The `ftl code` command runs a coding task inside an isolated Docker sandbox. The AI agent executes your task, makes changes to your codebase, and creates a snapshot that you can review, test, and merge.
+
+## Usage
+
+```bash
+ftl code "<task description>"
+```
+
+## Parameters
+
+<ParamField path="task" type="string" required>
+  Description of the coding task to perform. Should be clear and specific.
+</ParamField>
+
+## Example
+
+```bash
+$ ftl code "create login component"
+```
+
+```bash
+$ ftl code "add user authentication with JWT tokens"
+```
+
+```bash
+$ ftl code "fix the memory leak in the upload handler"
+```
+
+## Prerequisites
+
+Before running `ftl code`, ensure:
+
+1. You've run `ftl setup` to configure your agent and credentials
+2. You've run `ftl init` in your project directory to create `.ftlconfig`
+3. Docker is running
+
+## What Happens
+
+When you run `ftl code`:
+
+1. **Validation** - Checks that `.ftlconfig` exists in the current directory or parent directories
+2. **Sandbox Launch** - Starts an isolated Docker container with your codebase
+3. **Task Execution** - The AI agent analyzes your task and makes changes
+4. **Snapshot Creation** - Changes are captured in a snapshot for review
+5. **Review Prompt** - You can test, diff, merge, or reject the changes
+
+## Error: No Config Found
+
+If you haven't initialized FTL in your project:
+
+```bash
+$ ftl code "add tests"
+No .ftlconfig found. Run 'ftl init' first.
+```
+
+Solution: Run `ftl init` in your project directory.
+
+## Task Description Tips
+
+Write clear, actionable task descriptions:
+
+**Good examples:**
+- "add pagination to the users table"
+- "refactor the auth service to use async/await"
+- "fix the race condition in the cache update logic"
+- "add unit tests for the payment processor"
+
+**Avoid vague descriptions:**
+- "make it better" (too vague)
+- "fix bugs" (not specific)
+- "update code" (no clear goal)
+
+## Working with Snapshots
+
+After a task completes, FTL creates a snapshot with all changes. You can:
+
+- Review changes with `ftl snapshots`
+- See detailed diffs
+- Run tests to validate changes
+- Merge accepted changes back to your working directory
+- Reject unwanted changes
+
+See [ftl snapshots](/cli/snapshots) for snapshot management.
+
+## Interactive Shell Mode
+
+If you run `ftl` without a command, you enter interactive shell mode where you can:
+
+- Run multiple tasks in sequence
+- Use session commands: `test`, `diff`, `merge`, `reject`
+- Manage snapshots with `list`, `restore <id>`
+
+## See Also
+
+- [ftl init](/cli/init) - Initialize FTL in a project
+- [ftl snapshots](/cli/snapshots) - Manage snapshots
+- [ftl logs](/cli/logs) - View session history

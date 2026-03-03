@@ -1,0 +1,111 @@
+---
+title: ftl auth
+description: Save API credentials and tokens to FTL's secure credential store
+---
+
+## Overview
+
+The `ftl auth` command saves API credentials and authentication tokens to `~/.ftl/credentials`. These credentials are securely loaded and used by FTL agents and services.
+
+## Usage
+
+```bash
+ftl auth <key> <value>
+```
+
+## Parameters
+
+<ParamField path="key" type="string" required>
+  The credential name (e.g., `ANTHROPIC_API_KEY`, `AWS_BEARER_TOKEN_BEDROCK`)
+</ParamField>
+
+<ParamField path="value" type="string" required>
+  The credential value (API key, token, or secret)
+</ParamField>
+
+## Examples
+
+### Save Anthropic API Key
+
+```bash
+$ ftl auth ANTHROPIC_API_KEY sk-ant-api03-xxx
+Saved ANTHROPIC_API_KEY to ~/.ftl/credentials
+```
+
+### Save AWS Bedrock Token
+
+```bash
+$ ftl auth AWS_BEARER_TOKEN_BEDROCK ABSK...
+Saved AWS_BEARER_TOKEN_BEDROCK to ~/.ftl/credentials
+```
+
+### Save OpenAI API Key
+
+```bash
+$ ftl auth OPENAI_API_KEY sk-proj-xxx
+Saved OPENAI_API_KEY to ~/.ftl/credentials
+```
+
+## Credential Storage
+
+Credentials are stored in `~/.ftl/credentials` as environment variable exports:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-api03-xxx
+export AWS_BEARER_TOKEN_BEDROCK=ABSK...
+```
+
+## Security Considerations
+
+- Credentials are stored in plaintext in `~/.ftl/credentials`
+- Ensure this file has appropriate permissions (readable only by your user)
+- Never commit `~/.ftl/credentials` to version control
+- Rotate credentials regularly
+
+## How Credentials Are Used
+
+FTL loads credentials from `~/.ftl/credentials` when:
+
+- Starting the FTL shell
+- Running `ftl code` tasks
+- Executing agent actions that require API access
+- Generating tests with the configured tester model
+
+Credentials are also read from environment variables, which take precedence over the credentials file.
+
+## Checking Current Credentials
+
+To see what credentials are configured:
+
+```bash
+$ cat ~/.ftl/credentials
+export ANTHROPIC_API_KEY=sk-ant-api03-xxx
+```
+
+## Removing Credentials
+
+To remove a credential, manually edit `~/.ftl/credentials` and delete the corresponding line.
+
+## Common Credential Keys
+
+| Key | Purpose | Where to Get |
+|-----|---------|-------------|
+| `ANTHROPIC_API_KEY` | Claude API access | https://console.anthropic.com |
+| `OPENAI_API_KEY` | OpenAI API access | https://platform.openai.com |
+| `AWS_BEARER_TOKEN_BEDROCK` | AWS Bedrock access | AWS Console |
+
+## Alternative: Environment Variables
+
+You can also set credentials as environment variables instead of using `ftl auth`:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-api03-xxx
+ftl code "your task"
+```
+
+Environment variables take precedence over `~/.ftl/credentials`.
+
+## See Also
+
+- [ftl setup](/cli/setup) - Initial setup wizard (includes API key configuration)
+- [ftl config](/cli/config) - Configure AWS integration

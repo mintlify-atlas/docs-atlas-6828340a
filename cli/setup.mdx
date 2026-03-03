@@ -1,0 +1,111 @@
+---
+title: ftl setup
+description: One-command setup for FTL - choose agents, tester model, pull sandbox image, and save API key
+---
+
+## Overview
+
+The `ftl setup` command provides an interactive wizard to configure FTL with everything you need to get started. It guides you through choosing an AI agent, selecting a test generation model, pulling the Docker sandbox image, and configuring your API credentials.
+
+## Usage
+
+```bash
+ftl setup
+```
+
+## What It Does
+
+The setup wizard walks through these steps:
+
+1. **Docker Check** - Verifies Docker is installed and running
+2. **Agent Selection** - Choose your preferred AI coding agent:
+   - Claude Code (Anthropic, recommended)
+   - Codex (OpenAI)
+   - Aider (open-source)
+   - Kiro (AWS)
+3. **Image Setup** - Pulls or builds the `ftl-sandbox` Docker image
+4. **Tester Model** - Select which model to use for test generation:
+   - Anthropic API (claude-haiku)
+   - AWS Bedrock (claude-sonnet)
+   - Skip test generation
+5. **API Key Configuration** - Save your ANTHROPIC_API_KEY to `~/.ftl/credentials`
+
+## Example Session
+
+```bash
+$ ftl setup
+Checking Docker...
+  Docker is running.
+
+Which agent do you want to use?
+  1. Claude Code  (Anthropic, recommended)
+  2. Codex        (OpenAI)
+  3. Aider        (open-source)
+  4. Kiro         (AWS)
+
+  Choice [1]: 1
+
+  Pulling vvenne/ftl:latest...
+  Pulled.
+
+Which model for test generation?
+  1. Anthropic API — claude-haiku  (uses ANTHROPIC_API_KEY)
+  2. AWS Bedrock   — claude-sonnet (uses AWS credentials)
+  3. Skip test generation
+
+  Choice [1]: 1
+  Tester: Anthropic API — claude-haiku  (uses ANTHROPIC_API_KEY)
+
+Anthhropic API key
+  Get one at https://console.anthropic.com
+  ANTHROPIC_API_KEY: ********************
+  Saved to ~/.ftl/credentials
+
+Setup complete.
+  Next: cd your-project && ftl init && ftl code 'your task'
+```
+
+## Image Reconfiguration
+
+If the `ftl-sandbox` image already exists, setup will ask if you want to reconfigure:
+
+```bash
+ftl-sandbox image already exists. Reconfigure? [y/N]: n
+  Skipping image setup.
+```
+
+## Kiro Authentication
+
+When selecting the Kiro agent, you'll see special instructions for browser-based authentication:
+
+```bash
+Kiro authentication
+  Kiro uses browser-based login. After your first ftl code run,
+  authenticate with:
+  docker exec -it $(docker ps -qf ancestor=ftl-sandbox) kiro-cli login
+  Credentials persist in the container until it is removed.
+```
+
+## Fallback Behavior
+
+If pulling from Docker Hub fails, setup automatically falls back to building the image locally:
+
+```bash
+  Pulling vvenne/ftl:latest...
+  Hub pull failed — building locally (one-time)...
+  Image ready.
+```
+
+## Next Steps
+
+After running setup:
+
+1. Navigate to your project directory
+2. Run `ftl init` to create a `.ftlconfig` file
+3. Run `ftl code "your task"` to start coding
+
+## See Also
+
+- [ftl init](/cli/init) - Initialize FTL in a project
+- [ftl auth](/cli/auth) - Manage credentials
+- [ftl config](/cli/config) - Configure AWS integration

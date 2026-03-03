@@ -1,0 +1,391 @@
+---
+title: AWS Integration
+description: S3 snapshots, CloudWatch tracing, Secrets Manager, and Bedrock Guardrails
+---
+
+FTL integrates with multiple AWS services for storage, observability, secrets management, and safety controls.
+
+<Note>
+AWS features require `boto3`:
+```bash
+pip install -e ".[aws]"
+```
+</Note>
+
+## CloudWatch Logs Tracing
+
+Structured JSON tracing to CloudWatch Logs for every FTL session.
+
+### Configuration
+
+Activated via `.ftlconfig`:
+
+```yaml .ftlconfig
+cloudwatch_log_group: /ftl/sessions
+```
+
+### Span Types
+
+The tracer emits three span types:
+
+<Tabs>
+  <Tab title="stage">
+    High-level orchestrator stages like snapshot, boot, agent, tests
+    
+    ```json
+    {
+      "trace_id": "abc12345",
+      "span_type": "stage",
+      "name": "agent",
+      "elapsed_ms": 4200,
+      "timestamp": "2024-01-15T10:30:00.000Z"
+    }
+    ```
+  </Tab>
+  <Tab title="tool">
+    Individual agent tool calls (Read, Write, Bash, etc.)
+    
+    ```json
+    {
+      "trace_id": "abc12345",
+      "span_type": "tool",
+      "name": "Write",
+      "elapsed_ms": 12,
+      "file_path": "/workspace/src/main.py",
+      "timestamp": "2024-01-15T10:30:01.234Z"
+    }
+    ```
+  </Tab>
+  <Tab title="session">
+    Session lifecycle events (start, merge, reject)
+    
+    ```json
+    {
+      "trace_id": "abc12345",
+      "span_type": "session",
+      "name": "merge",
+      "task": "Add user authentication",
+      "files_changed": 3,
+      "timestamp": "2024-01-15T10:35:00.000Z"
+    }
+    ```
+  </Tab>
+</Tabs>
+
+### Implementation
+
+```python Source: ftl/cloudwatch.py:29-46
+def init(log_group, log_stream):
+    """Initialize the CloudWatch singleton for a session.
+
+    Must be called once per session before any emit() calls.
+    No-ops if log_group is empty or boto3 is unavailable.
+    """
+    global _client, _log_group, _log_stream
+    if not log_group:
+        return
+    try:
+        import boto3
+        _client = boto3.client("logs")
+        _log_group = log_group
+        _log_stream = log_stream
+        _ensure()
+    except Exception:
+        _client = None
+```
+
+The `init()` function creates a singleton CloudWatch client for the session.
+
+### Emitting Spans
+
+```python Source: ftl/cloudwatch.py:48-74
+def emit(trace_id, span_type, name, elapsed_ms=None, **meta):
+    """Emit a single span to CloudWatch Logs.
+
+    Always returns immediately; never raises. All errors are silently swallowed
+    because tracing is optional and must never break the main workflow.
+    """
+    if not _client:
+        return
+    event = {
+        "trace_id": trace_id,
+        "span_type": span_type,
+        "name": name,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if elapsed_ms is not None:
+        event["elapsed_ms"] = round(elapsed_ms)
+    event.update(meta)
+    with _lock:
+        try:
+            _client.put_log_events(
+                logGroupName=_log_group,
+                logStreamName=_log_stream,
+                logEvents=[{"timestamp": int(time.time() * 1000),
+                            "message": json.dumps(event)}],
+            )
+        except Exception:
+            pass  # logging is optional, never raise
+```
+
+<Tip>
+`emit()` never raises exceptions - tracing failures are silently ignored to avoid breaking the main workflow.
+</Tip>
+
+### Querying with CloudWatch Insights
+
+Find all events for a session:
+
+```sql
+filter trace_id = "abc12345" 
+| sort @timestamp asc
+```
+
+Find slow agent operations:
+
+```sql
+filter span_type = "stage" and elapsed_ms > 5000
+| sort elapsed_ms desc
+```
+
+Aggregate tool usage:
+
+```sql
+filter span_type = "tool"
+| stats count() by name
+```
+
+## Secrets Manager
+
+Load credentials from AWS Secrets Manager with automatic JSON expansion.
+
+### Configuration
+
+Set a prefix in `.ftlconfig`:
+
+```yaml .ftlconfig
+secrets_prefix: ftl/prod/keys
+```
+
+### Loading Secrets
+
+```python Source: ftl/secrets.py:4-36
+def load_from_secrets_manager(prefix):
+    """Fetch all secrets under a Secrets Manager prefix.
+
+    Secrets with JSON object values are expanded into multiple keys.
+    Plain strings use the last path component as the key name.
+
+    Returns {KEY: value} dict, or {} on any error.
+    """
+    if not prefix:
+        return {}
+    try:
+        import boto3
+        client = boto3.client("secretsmanager")
+        secrets = {}
+        paginator = client.get_paginator("list_secrets")
+        for page in paginator.paginate(Filters=[{"Key": "name", "Values": [prefix]}]):
+            for secret in page["SecretList"]:
+                try:
+                    val = client.get_secret_value(SecretId=secret["ARN"])["SecretString"]
+                    try:
+                        parsed = json.loads(val)
+                        if isinstance(parsed, dict):
+                            secrets.update({k: str(v) for k, v in parsed.items()})
+                            continue
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    key = secret["Name"].rstrip("/").split("/")[-1].upper()
+                    secrets[key] = val
+                except Exception:
+                    pass
+        return secrets
+    except Exception:
+        return {}
+```
+
+### Secret Formats
+
+<Tabs>
+  <Tab title="JSON Object">
+    Secrets containing JSON objects are expanded into individual environment variables:
+    
+    ```json Secret: ftl/prod/keys/stripe
+    {
+      "STRIPE_SECRET_KEY": "sk_live_...",
+      "STRIPE_WEBHOOK_SECRET": "whsec_..."
+    }
+    ```
+    
+    Results in:
+    ```python
+    {
+      "STRIPE_SECRET_KEY": "sk_live_...",
+      "STRIPE_WEBHOOK_SECRET": "whsec_..."
+    }
+    ```
+  </Tab>
+  <Tab title="Plain String">
+    Plain string secrets use the last path component as the key name:
+    
+    ```text Secret: ftl/prod/keys/openai
+    sk-proj-abc123...
+    ```
+    
+    Results in:
+    ```python
+    {
+      "OPENAI": "sk-proj-abc123..."
+    }
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+All errors are silently ignored - the function returns `{}` on any failure. Check CloudWatch or CloudTrail logs for debugging.
+</Warning>
+
+## Bedrock Guardrails
+
+Apply content safety policies to agent output using Amazon Bedrock Guardrails.
+
+### Implementation
+
+```python Source: ftl/guardrails.py:1-32
+def apply_guardrail(guardrail_id, guardrail_version, text):
+    """Apply a Bedrock Guardrail to arbitrary text.
+
+    Returns (blocked: bool, findings: list[str]). Never raises.
+    """
+    if not guardrail_id or not text:
+        return False, []
+    try:
+        import boto3
+        client = boto3.client("bedrock-runtime")
+        response = client.apply_guardrail(
+            guardrailIdentifier=guardrail_id,
+            guardrailVersion=guardrail_version or "DRAFT",
+            source="OUTPUT",
+            content=[{"text": {"text": text}}],
+        )
+        blocked = response.get("action") == "GUARDRAIL_INTERVENED"
+        findings = []
+        for assessment in response.get("assessments", []):
+            sip = assessment.get("sensitiveInformationPolicy", {})
+            for entity in sip.get("piiEntities", []):
+                if entity.get("action") in ("BLOCKED", "ANONYMIZED"):
+                    findings.append(f"Sensitive info: {entity['type']}")
+            for regex in sip.get("regexes", []):
+                if regex.get("action") in ("BLOCKED", "ANONYMIZED"):
+                    findings.append(f"Pattern match: {regex.get('name', 'custom')}")
+            for f in assessment.get("contentPolicy", {}).get("filters", []):
+                if f.get("action") == "BLOCKED":
+                    findings.append(f"Content policy: {f['type']}")
+        return blocked, findings
+    except Exception:
+        return False, []
+```
+
+### Return Values
+
+The function returns a tuple:
+
+1. **blocked** (`bool`) - `True` if the guardrail intervened
+2. **findings** (`list[str]`) - Human-readable list of violations
+
+### Policy Types Detected
+
+<AccordionGroup>
+  <Accordion title="Sensitive Information Policy">
+    Detects PII entities and regex pattern matches:
+    
+    ```python
+    for entity in sip.get("piiEntities", []):
+        if entity.get("action") in ("BLOCKED", "ANONYMIZED"):
+            findings.append(f"Sensitive info: {entity['type']}")
+    ```
+    
+    Examples: Credit card numbers, SSN, email addresses, phone numbers
+  </Accordion>
+  
+  <Accordion title="Custom Regex Patterns">
+    Custom pattern matching from guardrail configuration:
+    
+    ```python
+    for regex in sip.get("regexes", []):
+        if regex.get("action") in ("BLOCKED", "ANONYMIZED"):
+            findings.append(f"Pattern match: {regex.get('name', 'custom')}")
+    ```
+  </Accordion>
+  
+  <Accordion title="Content Policy Filters">
+    Content safety filters (violence, hate speech, etc.):
+    
+    ```python
+    for f in assessment.get("contentPolicy", {}).get("filters", []):
+        if f.get("action") == "BLOCKED":
+            findings.append(f"Content policy: {f['type']}")
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Usage Example
+
+```python
+from ftl.guardrails import apply_guardrail
+
+# Check agent output for sensitive content
+blocked, findings = apply_guardrail(
+    guardrail_id="abc123xyz",
+    guardrail_version="1",  # or "DRAFT"
+    text=agent_output
+)
+
+if blocked:
+    print(f"Guardrail blocked output: {findings}")
+    # ["Sensitive info: CREDIT_CARD", "Content policy: VIOLENCE"]
+else:
+    print("Output passed guardrails")
+```
+
+<Tip>
+Use `source="OUTPUT"` to check agent-generated content. Use `source="INPUT"` for user prompts.
+</Tip>
+
+## S3 Snapshots
+
+While not in the provided source files, FTL supports S3 for storing workspace snapshots. Check the main documentation for snapshot configuration.
+
+## AWS Credentials
+
+All AWS integrations use the standard boto3 credential chain:
+
+<Steps>
+  <Step title="Environment variables">
+    `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`
+  </Step>
+  <Step title="Shared credentials file">
+    `~/.aws/credentials` and `~/.aws/config`
+  </Step>
+  <Step title="IAM role">
+    EC2 instance profile or ECS task role
+  </Step>
+</Steps>
+
+## Feature Summary
+
+<CardGroup cols={2}>
+  <Card title="CloudWatch Logs" icon="chart-line">
+    Structured JSON tracing with CloudWatch Insights queries
+  </Card>
+  <Card title="Secrets Manager" icon="key">
+    Automatic secret loading with JSON expansion
+  </Card>
+  <Card title="Bedrock Guardrails" icon="shield-halved">
+    Content safety filtering for agent output
+  </Card>
+  <Card title="S3 Storage" icon="database">
+    Workspace snapshots in S3 buckets
+  </Card>
+</CardGroup>

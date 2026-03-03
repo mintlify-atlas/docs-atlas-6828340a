@@ -1,0 +1,516 @@
+---
+title: 'AWS Setup'
+description: 'Configure FTL to use AWS for snapshots, secrets, tracing, and guardrails'
+---
+
+FTL supports four AWS-backed capabilities that can be used independently or together to enhance security and observability.
+
+## AWS Capabilities
+
+<CardGroup cols={2}>
+  <Card title="S3 Snapshots" icon="database">
+    Store project snapshots in S3 instead of local disk
+  </Card>
+  <Card title="Secrets Manager" icon="key">
+    Load secrets from AWS Secrets Manager instead of `.env`
+  </Card>
+  <Card title="CloudWatch Tracing" icon="chart-line">
+    Emit structured session logs to CloudWatch
+  </Card>
+  <Card title="Bedrock Guardrails" icon="shield-halved">
+    Hard-block merges on detected secrets or PII
+  </Card>
+</CardGroup>
+
+## Quick Setup Wizard
+
+Provision all AWS resources and update `.ftlconfig` in one command:
+
+```bash
+ftl config --aws
+```
+
+<Steps>
+  <Step title="Install AWS Dependencies">
+    ```bash
+    pip install -e ".[aws]"
+    ```
+  </Step>
+  
+  <Step title="Configure AWS Credentials">
+    Use any standard AWS credential method:
+    
+    <Tabs>
+      <Tab title="AWS CLI">
+        ```bash
+        aws configure
+        ```
+      </Tab>
+      
+      <Tab title="Environment Variables">
+        ```bash
+        export AWS_ACCESS_KEY_ID=AKIA...
+        export AWS_SECRET_ACCESS_KEY=...
+        export AWS_DEFAULT_REGION=us-east-1
+        ```
+      </Tab>
+      
+      <Tab title="FTL Auth">
+        ```bash
+        ftl auth AWS_ACCESS_KEY_ID AKIA...
+        ftl auth AWS_SECRET_ACCESS_KEY ...
+        ftl auth AWS_DEFAULT_REGION us-east-1
+        ```
+        
+        Credentials persist across sessions in `~/.ftl/credentials`.
+      </Tab>
+    </Tabs>
+  </Step>
+  
+  <Step title="Run Wizard">
+    ```bash
+    cd your-project
+    ftl config --aws
+    ```
+    
+    Output:
+    ```
+    Configuring FTL for AWS...
+      Account: 123456789012  Region: us-east-1
+      S3 bucket: ftl-123456789012-us-east-1
+        Created.
+      CloudWatch log group: /ftl/myproject
+        Created.
+      Bedrock Guardrail: ftl-myproject
+        Created (id=gr1a2b3c4d5e, version=1).
+      Secrets Manager prefix (leave blank to skip):
+    
+    Done. .ftlconfig updated.
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  The wizard is idempotent. Run it multiple times without creating duplicate resources.
+</Note>
+
+## Manual Configuration
+
+You can also configure AWS capabilities individually by editing `.ftlconfig`.
+
+### S3 Snapshots
+
+Store snapshots in S3 instead of local disk:
+
+<Steps>
+  <Step title="Create S3 Bucket">
+    ```bash
+    aws s3 mb s3://my-ftl-snapshots --region us-east-1
+    ```
+  </Step>
+  
+  <Step title="Update .ftlconfig">
+    ```json .ftlconfig
+    {
+      "snapshot_backend": "s3",
+      "s3_bucket": "my-ftl-snapshots"
+    }
+    ```
+  </Step>
+</Steps>
+
+**How it works:**
+
+- Snapshots are stored as gzipped tarballs at `s3://<bucket>/snapshots/<project-hash>/<id>.tar.gz`
+- Local cache at `~/.ftl/snapshots/` is kept so Docker can mount snapshots without per-task downloads
+- On restore, FTL checks local cache first, then downloads from S3 if needed
+
+### Secrets Manager
+
+Load secrets from AWS Secrets Manager instead of `.env`:
+
+<Steps>
+  <Step title="Store Secrets">
+    Create secrets in AWS Secrets Manager:
+    
+    ```bash
+    # JSON object (expands to multiple keys)
+    aws secretsmanager create-secret \
+      --name /myproject/prod/api-keys \
+      --secret-string '{"STRIPE_SECRET_KEY":"sk_live_...","OPENAI_API_KEY":"sk-..."}'
+    
+    # Plain string (key name from path)
+    aws secretsmanager create-secret \
+      --name /myproject/prod/DATABASE_URL \
+      --secret-string 'postgresql://...'
+    ```
+  </Step>
+  
+  <Step title="Update .ftlconfig">
+    ```json .ftlconfig
+    {
+      "secrets_manager_prefix": "/myproject/prod/"
+    }
+    ```
+  </Step>
+</Steps>
+
+**Secret expansion rules:**
+
+<AccordionGroup>
+  <Accordion title="JSON Object Secrets">
+    Secrets with JSON object values are expanded into individual keys:
+    
+    ```json
+    {
+      "API_KEY": "sk-...",
+      "DB_PASSWORD": "..."
+    }
+    ```
+    
+    Creates environment variables `API_KEY` and `DB_PASSWORD`.
+  </Accordion>
+  
+  <Accordion title="Plain String Secrets">
+    Secrets with plain string values use the last path segment as the key name, uppercased:
+    
+    ```
+    /myproject/prod/database_url → DATABASE_URL
+    /myproject/prod/stripe-key → STRIPE-KEY
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### CloudWatch Tracing
+
+Emit structured session logs to CloudWatch:
+
+<Steps>
+  <Step title="Create Log Group">
+    ```bash
+    aws logs create-log-group --log-group-name /ftl/myproject
+    ```
+  </Step>
+  
+  <Step title="Update .ftlconfig">
+    ```json .ftlconfig
+    {
+      "cloudwatch_log_group": "/ftl/myproject"
+    }
+    ```
+  </Step>
+</Steps>
+
+**Log events:**
+
+FTL emits structured JSON events for each session stage:
+
+```json
+{
+  "timestamp": "2026-03-03T10:30:00Z",
+  "project": "/home/user/myproject",
+  "snapshot": "abc123",
+  "event": "agent_complete",
+  "duration_ms": 45000,
+  "task": "create login component"
+}
+```
+
+Events: `snapshot`, `boot`, `agent_start`, `agent_complete`, `tests_complete`, `merge`, `reject`
+
+### Bedrock Guardrails
+
+Hard-block merges on detected secrets or PII:
+
+<Steps>
+  <Step title="Create Guardrail">
+    ```python
+    import boto3
+
+    bedrock = boto3.client('bedrock', region_name='us-east-1')
+    response = bedrock.create_guardrail(
+        name='ftl-myproject',
+        description='FTL credential and content safety guardrail',
+        sensitiveInformationPolicyConfig={
+            'piiEntitiesConfig': [
+                {'type': t, 'action': 'BLOCK'}
+                for t in [
+                    'AWS_ACCESS_KEY',
+                    'API_KEY',
+                    'USERNAME',
+                    'PASSWORD',
+                    'EMAIL',
+                    'CREDIT_DEBIT_CARD_NUMBER',
+                ]
+            ]
+        },
+        blockedInputMessaging='Input blocked by FTL guardrail.',
+        blockedOutputsMessaging='Output blocked by FTL guardrail.',
+    )
+    
+    guardrail_id = response['guardrailId']
+    
+    # Create version
+    ver_response = bedrock.create_guardrail_version(
+        guardrailIdentifier=guardrail_id
+    )
+    guardrail_version = str(ver_response['version'])
+    ```
+  </Step>
+  
+  <Step title="Update .ftlconfig">
+    ```json .ftlconfig
+    {
+      "guardrail_id": "gr1a2b3c4d5e",
+      "guardrail_version": "1"
+    }
+    ```
+  </Step>
+</Steps>
+
+**Behavior:**
+
+<Warning>
+  When `guardrail_id` is set, FTL applies the Bedrock Guardrail to the full diff text before human review. If the guardrail intervenes, the merge is **hard-blocked** and all changes are discarded.
+</Warning>
+
+Findings (PII type, content policy category) are printed before the block decision:
+
+```
+Guardrail findings:
+  - AWS_ACCESS_KEY detected
+  - EMAIL detected
+
+Merge BLOCKED by guardrail. Changes discarded.
+```
+
+If the guardrail passes, review proceeds normally.
+
+## Wizard Implementation
+
+The `ftl config --aws` wizard is implemented in `ftl/cli.py`:
+
+```python ftl/cli.py
+def _configure_aws():
+    """Provision AWS resources and write config for AWS mode."""
+    console = Console()
+
+    try:
+        import boto3
+    except ImportError:
+        console.print("[red]boto3 not installed. Run: pip install -e \".[aws]\"[/red]")
+        raise SystemExit(1)
+
+    # 1. Get account ID and region
+    console.print("[bold]Configuring FTL for AWS...[/bold]")
+    sts = boto3.client("sts")
+    identity = sts.get_caller_identity()
+    account_id = identity["Account"]
+    region = boto3.session.Session().region_name or "us-east-1"
+    console.print(f"  Account: {account_id}  Region: {region}")
+
+    config_path = find_config()
+    if not config_path:
+        console.print("[red]No .ftlconfig found. Run 'ftl init' first.[/red]")
+        raise SystemExit(1)
+    project_name = config_path.parent.name
+
+    # 2. Create S3 bucket (idempotent)
+    bucket_name = f"ftl-{account_id}-{region}"
+    s3 = boto3.client("s3", region_name=region)
+    console.print(f"  S3 bucket: {bucket_name}")
+    try:
+        if region == "us-east-1":
+            s3.create_bucket(Bucket=bucket_name)
+        else:
+            s3.create_bucket(
+                Bucket=bucket_name,
+                CreateBucketConfiguration={"LocationConstraint": region},
+            )
+        console.print("    [green]Created.[/green]")
+    except s3.exceptions.BucketAlreadyOwnedByYou:
+        console.print("    [dim]Already exists.[/dim]")
+
+    # [CloudWatch, Guardrail, Secrets Manager setup...]
+
+    # 6. Merge into .ftlconfig
+    existing["snapshot_backend"] = "s3"
+    existing["s3_bucket"] = bucket_name
+    existing["cloudwatch_log_group"] = log_group
+    if guardrail_id:
+        existing["guardrail_id"] = guardrail_id
+        existing["guardrail_version"] = guardrail_version
+    if sm_prefix:
+        existing["secrets_manager_prefix"] = sm_prefix
+
+    config_path.write_text(json.dumps(existing, indent=2) + "\n")
+    console.print(f"\n[bold green]Done. .ftlconfig updated.[/bold green]")
+```
+
+## Full AWS Example
+
+`.ftlconfig` with all AWS capabilities enabled:
+
+```json .ftlconfig
+{
+  "agent": "claude-code",
+  "tester": "bedrock/us.anthropic.claude-sonnet-4-6",
+  
+  "snapshot_backend": "s3",
+  "s3_bucket": "ftl-123456789012-us-east-1",
+  
+  "secrets_manager_prefix": "/myproject/prod/",
+  
+  "cloudwatch_log_group": "/ftl/myproject",
+  
+  "guardrail_id": "gr1a2b3c4d5e",
+  "guardrail_version": "1",
+  
+  "setup": "pip install -r requirements.txt 2>/dev/null; npm install --silent 2>/dev/null; true"
+}
+```
+
+## AWS vs Local Mode
+
+| Capability | Local (default) | AWS mode |
+|------------|----------------|----------|
+| **Snapshots** | rsync to `~/.ftl/snapshots/` | S3 bucket |
+| **Traces** | `~/.ftl/logs.jsonl` | CloudWatch Logs |
+| **Secrets** | Read from `.env` | Secrets Manager |
+| **Diff safety** | Local credential linter | Bedrock Guardrails (hard-block) |
+
+## IAM Permissions
+
+Required IAM permissions for each capability:
+
+<AccordionGroup>
+  <Accordion title="S3 Snapshots">
+    ```json
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Action": [
+            "s3:CreateBucket",
+            "s3:PutObject",
+            "s3:GetObject",
+            "s3:DeleteObject"
+          ],
+          "Resource": [
+            "arn:aws:s3:::ftl-*",
+            "arn:aws:s3:::ftl-*/*"
+          ]
+        }
+      ]
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="CloudWatch Logs">
+    ```json
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Action": [
+            "logs:CreateLogGroup",
+            "logs:CreateLogStream",
+            "logs:PutLogEvents"
+          ],
+          "Resource": "arn:aws:logs:*:*:log-group:/ftl/*"
+        }
+      ]
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Secrets Manager">
+    ```json
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Action": [
+            "secretsmanager:GetSecretValue",
+            "secretsmanager:ListSecrets"
+          ],
+          "Resource": "arn:aws:secretsmanager:*:*:secret:/myproject/*"
+        }
+      ]
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Bedrock Guardrails">
+    ```json
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Action": [
+            "bedrock:CreateGuardrail",
+            "bedrock:CreateGuardrailVersion",
+            "bedrock:ListGuardrails",
+            "bedrock:ApplyGuardrail"
+          ],
+          "Resource": "*"
+        }
+      ]
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="boto3 not installed">
+    ```bash
+    pip install -e ".[aws]"
+    ```
+  </Accordion>
+  
+  <Accordion title="Credentials not configured">
+    Check AWS credentials:
+    
+    ```bash
+    aws sts get-caller-identity
+    ```
+    
+    If this fails, configure credentials:
+    
+    ```bash
+    aws configure
+    # or
+    ftl auth AWS_ACCESS_KEY_ID AKIA...
+    ftl auth AWS_SECRET_ACCESS_KEY ...
+    ftl auth AWS_DEFAULT_REGION us-east-1
+    ```
+  </Accordion>
+  
+  <Accordion title="S3 bucket creation fails">
+    Ensure your AWS credentials have `s3:CreateBucket` permission.
+    
+    If the bucket already exists in another account, choose a different name in `.ftlconfig`:
+    
+    ```json .ftlconfig
+    {
+      "s3_bucket": "my-unique-ftl-bucket-name"
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Guardrail not found">
+    If you see "guardrail not found", verify the ID:
+    
+    ```bash
+    aws bedrock list-guardrails
+    ```
+    
+    Update `.ftlconfig` with the correct `guardrail_id`.
+  </Accordion>
+</AccordionGroup>

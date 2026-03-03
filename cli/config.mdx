@@ -1,0 +1,192 @@
+---
+title: ftl config
+description: Configure FTL settings, including AWS integration for snapshots, tracing, secrets, and guardrails
+---
+
+## Overview
+
+The `ftl config` command configures advanced FTL settings. Currently supports AWS integration for production-grade features including S3 snapshots, CloudWatch logging, Secrets Manager, and Bedrock Guardrails.
+
+## Usage
+
+```bash
+ftl config --aws
+```
+
+## Options
+
+<ParamField path="--aws" type="boolean" default="false">
+  Configure FTL to use AWS for snapshots, tracing, secrets, and guardrails
+</ParamField>
+
+## AWS Configuration
+
+### Prerequisites
+
+Before running `ftl config --aws`:
+
+1. Install AWS dependencies: `pip install -e ".[aws]"`
+2. Configure AWS credentials (via `aws configure` or environment variables)
+3. Run `ftl init` in your project to create `.ftlconfig`
+4. Ensure you have permissions to create S3 buckets, CloudWatch log groups, and Bedrock guardrails
+
+### What It Does
+
+When you run `ftl config --aws`, FTL:
+
+1. **Detects AWS Account** - Gets your account ID and region
+2. **Creates S3 Bucket** - Creates `ftl-{account_id}-{region}` for snapshot storage
+3. **Creates CloudWatch Log Group** - Creates `/ftl/{project_name}` for session logs
+4. **Creates Bedrock Guardrail** - Creates `ftl-{project_name}` to block sensitive data
+5. **Prompts for Secrets Manager** - Optionally configure a prefix for secret storage
+6. **Updates .ftlconfig** - Writes AWS resource IDs to your project config
+
+### Example Session
+
+```bash
+$ ftl config --aws
+Configuring FTL for AWS...
+  Account: 123456789012  Region: us-east-1
+  S3 bucket: ftl-123456789012-us-east-1
+    Created.
+  CloudWatch log group: /ftl/my-project
+    Created.
+  Bedrock Guardrail: ftl-my-project
+    Created (id=abc123def, version=1).
+  Secrets Manager prefix (leave blank to skip): my-app/
+
+Done. .ftlconfig updated.
+  /home/user/my-project/.ftlconfig
+```
+
+### Idempotent Operations
+
+All AWS resource creation is idempotent. If resources already exist:
+
+```bash
+$ ftl config --aws
+Configuring FTL for AWS...
+  Account: 123456789012  Region: us-east-1
+  S3 bucket: ftl-123456789012-us-east-1
+    Already exists.
+  CloudWatch log group: /ftl/my-project
+    Already exists.
+  Bedrock Guardrail: ftl-my-project
+    Already exists (id=abc123def).
+```
+
+## AWS Resources Created
+
+### S3 Bucket
+
+- **Name**: `ftl-{account_id}-{region}`
+- **Purpose**: Stores project snapshots
+- **Replaces**: Local `~/.ftl/snapshots` directory
+
+### CloudWatch Log Group
+
+- **Name**: `/ftl/{project_name}`
+- **Purpose**: Centralized session audit logs
+- **Replaces**: Local `~/.ftl/sessions.log` file
+
+### Bedrock Guardrail
+
+- **Name**: `ftl-{project_name}`
+- **Purpose**: Blocks sensitive data in AI interactions
+- **Blocks**: AWS access keys, API keys, passwords, emails, credit cards, etc.
+
+### Secrets Manager (Optional)
+
+- **Prefix**: Custom (e.g., `my-app/`)
+- **Purpose**: Secure credential storage for agents
+- **Usage**: Agents can read secrets at runtime without exposing them
+
+## Updated .ftlconfig
+
+After AWS configuration, your `.ftlconfig` will include:
+
+```json
+{
+  "snapshot_backend": "s3",
+  "s3_bucket": "ftl-123456789012-us-east-1",
+  "cloudwatch_log_group": "/ftl/my-project",
+  "guardrail_id": "abc123def",
+  "guardrail_version": "1",
+  "secrets_manager_prefix": "my-app/"
+}
+```
+
+## Benefits of AWS Integration
+
+- **Team Collaboration**: Share snapshots across team members via S3
+- **Audit Trail**: Centralized logging in CloudWatch for compliance
+- **Security**: Bedrock Guardrails prevent credential leaks
+- **Secret Management**: Secure, rotatable credentials via Secrets Manager
+
+## IAM Permissions Required
+
+Your AWS credentials need these permissions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:PutObject",
+        "s3:GetObject",
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "bedrock:CreateGuardrail",
+        "bedrock:CreateGuardrailVersion",
+        "bedrock:ListGuardrails"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+## Switching Back to Local Mode
+
+To stop using AWS and revert to local storage, manually edit `.ftlconfig` and remove the AWS keys:
+
+```json
+{
+  "agent": "claude-code",
+  "tester": "claude-haiku-4-5-20251001"
+}
+```
+
+## Troubleshooting
+
+### boto3 Not Installed
+
+```bash
+$ ftl config --aws
+boto3 not installed. Run: pip install -e ".[aws]"
+```
+
+Solution: Install AWS dependencies.
+
+### No .ftlconfig Found
+
+```bash
+$ ftl config --aws
+No .ftlconfig found. Run 'ftl init' first.
+```
+
+Solution: Run `ftl init` in your project directory.
+
+### Permission Denied
+
+If you get AWS permission errors, ensure your IAM user or role has the required permissions listed above.
+
+## See Also
+
+- [ftl init](/cli/init) - Initialize FTL in a project
+- [ftl snapshots](/cli/snapshots) - Manage snapshots
+- [ftl logs](/cli/logs) - View session logs

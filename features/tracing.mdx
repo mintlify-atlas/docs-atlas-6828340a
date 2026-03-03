@@ -1,0 +1,300 @@
+---
+title: Tracing & Observability
+description: Langfuse integration, stage timing, and agent heartbeat monitoring
+---
+
+FTL provides multiple observability features to track agent performance and behavior.
+
+## Langfuse Tracing
+
+Automatic tracing of all LiteLLM completion calls to Langfuse.
+
+### Activation
+
+Set environment variables before running FTL:
+
+```bash
+ftl auth LANGFUSE_PUBLIC_KEY pk-lf-...
+ftl auth LANGFUSE_SECRET_KEY sk-lf-...
+```
+
+Or export directly:
+
+```bash
+export LANGFUSE_PUBLIC_KEY=pk-lf-...
+export LANGFUSE_SECRET_KEY=sk-lf-...
+```
+
+### Setup Function
+
+```python Source: ftl/tracing.py:26-39
+def setup_langfuse():
+    """Enable Langfuse tracing for all LiteLLM calls if credentials are set.
+
+    Returns True if Langfuse was activated, False otherwise.
+    """
+    if not (os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY")):
+        return False
+    try:
+        import litellm
+        litellm.success_callback = ["langfuse"]
+        litellm.failure_callback = ["langfuse"]
+        return True
+    except Exception:
+        return False
+```
+
+<Note>
+Langfuse tracing is opt-in via environment variables. Without credentials, `setup_langfuse()` returns `False` and no tracing occurs.
+</Note>
+
+### What Gets Traced
+
+Langfuse captures:
+
+- **Adversarial tester calls** - Test generation from `ftl.planner`
+- **Diff review calls** - Code review completions
+- **Q&A interactions** - Any direct LiteLLM usage
+
+<Warning>
+Langfuse does NOT trace Claude Code agent internals - only FTL's direct LiteLLM calls.
+</Warning>
+
+### Viewing Traces
+
+Once configured, view traces in the Langfuse dashboard:
+
+<Steps>
+  <Step title="Navigate to Langfuse">
+    Go to your Langfuse project dashboard
+  </Step>
+  <Step title="Filter by session">
+    Use session metadata to group related calls
+  </Step>
+  <Step title="Analyze performance">
+    View token usage, latency, and costs per call
+  </Step>
+</Steps>
+
+## Stage Timer
+
+Prints elapsed wall-clock time after each orchestrator stage.
+
+### Implementation
+
+```python Source: ftl/tracing.py:42-61
+class StageTimer:
+    """Prints elapsed wall-clock time after each named stage.
+
+    Usage:
+        t = StageTimer(console)
+        do_snapshot()
+        t.mark("snapshot")      # prints "  snapshot  0.8s"
+        do_boot()
+        t.mark("boot")          # prints "  boot  0.2s"
+    """
+
+    def __init__(self, console):
+        self.console = console
+        self._stage_start = time.time()
+
+    def mark(self, label):
+        elapsed = time.time() - self._stage_start
+        self._stage_start = time.time()
+        self.console.print(f"  [dim]{label}  {elapsed:.1f}s[/dim]")
+        return elapsed
+```
+
+### Usage Example
+
+```python
+from rich.console import Console
+from ftl.tracing import StageTimer
+
+console = Console()
+timer = StageTimer(console)
+
+# Stage 1: Snapshot
+create_workspace_snapshot()
+timer.mark("snapshot")  # Output: snapshot  0.8s
+
+# Stage 2: Boot sandbox
+sandbox.boot()
+timer.mark("boot")      # Output: boot  1.2s
+
+# Stage 3: Run agent
+agent.run(task)
+timer.mark("agent")     # Output: agent  4.5s
+```
+
+<Tip>
+The timer resets on each `mark()` call, so each measurement shows the time since the previous mark.
+</Tip>
+
+### Output Format
+
+The timer prints dimmed text with consistent formatting:
+
+```
+  snapshot  0.8s
+  boot  1.2s
+  agent  4.5s
+  tests  2.1s
+```
+
+## Agent Heartbeat
+
+Shows progress while waiting for the first byte of agent output.
+
+### The Problem
+
+Claude Code can take 10-15 seconds to start (cold start), which looks like a hang without feedback.
+
+### The Solution
+
+```python Source: ftl/tracing.py:64-100
+class AgentHeartbeat:
+    """Prints elapsed seconds in-place while waiting for first agent output.
+
+    Stops silently the moment the agent produces its first line.
+
+        heartbeat = AgentHeartbeat(console)
+        heartbeat.start()
+        for line in agent_output:
+            heartbeat.stop()   # stops on first line
+            console.print(line)
+    """
+
+    def __init__(self, console):
+        self.console = console
+        self._stop = threading.Event()
+        self._thread = None
+        self._t0 = None
+
+    def start(self):
+        self._t0 = time.time()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """Call on first agent output line — no-op if already stopped."""
+        self._stop.set()
+
+    def _run(self):
+        interval = 5
+        while not self._stop.wait(timeout=interval):
+            elapsed = int(time.time() - self._t0)
+            self.console.print(
+                f"  [dim]waiting for agent...  {elapsed}s[/dim]",
+                highlight=False,
+            )
+```
+
+### Usage Pattern
+
+```python
+from ftl.tracing import AgentHeartbeat
+
+heartbeat = AgentHeartbeat(console)
+heartbeat.start()
+
+for line in agent.run_streaming(task):
+    heartbeat.stop()  # Stop on first line
+    console.print(line)
+```
+
+### Output Example
+
+While waiting:
+
+```
+  waiting for agent...  5s
+  waiting for agent...  10s
+  waiting for agent...  15s
+```
+
+Once output arrives, the heartbeat stops and agent output displays normally.
+
+<Note>
+The heartbeat runs in a daemon thread and updates every 5 seconds.
+</Note>
+
+## Configuration Summary
+
+<ParamField path="LANGFUSE_PUBLIC_KEY" type="env var">
+  Langfuse project public key (starts with `pk-lf-`)
+</ParamField>
+
+<ParamField path="LANGFUSE_SECRET_KEY" type="env var">
+  Langfuse project secret key (starts with `sk-lf-`)
+</ParamField>
+
+<ParamField path="cloudwatch_log_group" type=".ftlconfig">
+  CloudWatch log group for structured tracing (see AWS Integration)
+</ParamField>
+
+## Tracing Comparison
+
+<CardGroup cols={2}>
+  <Card title="Langfuse" icon="brain">
+    Traces LiteLLM calls with token usage and cost tracking
+  </Card>
+  <Card title="CloudWatch" icon="aws">
+    Structured JSON spans for stages, tools, and sessions
+  </Card>
+  <Card title="Stage Timer" icon="stopwatch">
+    Simple wall-clock timing for orchestrator stages
+  </Card>
+  <Card title="Heartbeat" icon="heart-pulse">
+    User feedback during agent cold start
+  </Card>
+</CardGroup>
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Development vs Production">
+    Use Langfuse in development for debugging individual calls. Use CloudWatch in production for aggregated session analysis.
+  </Accordion>
+  
+  <Accordion title="Cost Monitoring">
+    Langfuse provides per-call token counts and costs. Monitor usage trends to optimize prompt engineering.
+  </Accordion>
+  
+  <Accordion title="Performance Analysis">
+    Combine StageTimer output with CloudWatch span data to identify bottlenecks in the orchestration pipeline.
+  </Accordion>
+  
+  <Accordion title="Error Tracking">
+    Langfuse's `failure_callback` captures failed LiteLLM calls. Check Langfuse for model errors vs application errors.
+  </Accordion>
+</AccordionGroup>
+
+## Integration Code
+
+Enable all observability features:
+
+```python
+from ftl.tracing import setup_langfuse, StageTimer, AgentHeartbeat
+from ftl.cloudwatch import init as init_cloudwatch
+from rich.console import Console
+
+# Langfuse (opt-in via env vars)
+langfuse_enabled = setup_langfuse()
+if langfuse_enabled:
+    print("Langfuse tracing enabled")
+
+# CloudWatch (opt-in via config)
+init_cloudwatch(
+    log_group="/ftl/sessions",
+    log_stream=f"session-{trace_id}"
+)
+
+# Stage timer (always on)
+console = Console()
+timer = StageTimer(console)
+
+# Agent heartbeat (use during agent calls)
+heartbeat = AgentHeartbeat(console)
+```

@@ -1,0 +1,571 @@
+---
+title: Sandbox Internals
+description: Docker container lifecycle, workspace management, and diff computation
+---
+
+The Docker sandbox isolates agent execution from the host filesystem while providing persistent container reuse to eliminate cold-boot overhead.
+
+## Container Lifecycle
+
+From the README (`README.md:382-397`):
+
+```
+Container lifecycle:
+- One persistent container per project path, keyed by a hash of the path
+- Workspace (/workspace) wiped and restored from snapshot on each task
+- Everything outside /workspace persists: user-installed packages in /home/ftl/.local/,
+  global npm installs, agent conversation history
+
+What persists across tasks in the same container:
+
+| Location                | On task reset | Notes                      |
+|-------------------------|---------------|----------------------------|
+| /workspace/             | Wiped         | Project files              |
+| /home/ftl/.local/       | Persists      | pip install packages       |
+| /usr/lib/python3/       | Persists      | Pre-installed libraries    |
+| Global node_modules     | Persists      | npm install -g packages    |
+| /home/ftl/.claude/      | Persists      | Agent conversation history |
+```
+
+<Info>
+Persistent containers mean zero cold-boot overhead after the first task. Setup commands run once; dependencies persist for the lifetime of the container.
+</Info>
+
+## DockerSandbox Class
+
+The core implementation lives in `sandbox/docker.py:120-384`.
+
+### Class-Level State
+
+```python
+class DockerSandbox(Sandbox):
+    _standby_id = None  # Shared across all instances in this process
+    _lock = threading.Lock()
+
+    def __init__(self):
+        self.container_id = None
+        self.fresh = False  # True if boot() created a new container this session
+        self._credentials = {}
+        self._agent_env = {}
+        self._project_path = None
+        atexit.register(self._cleanup_on_exit)
+```
+
+**Design notes:**
+- `_standby_id` is a class variable shared across all `DockerSandbox` instances in the same Python process
+- `_lock` serializes access to the shared standby state
+- `atexit` handler ensures containers aren't destroyed on process exit (they're reused)
+
+### Boot Sequence
+
+The `boot()` method implements a three-tier container lookup strategy:
+
+```python
+def boot(self, snapshot_path, credentials=None, agent_env=None, project_path=None,
+         setup_cmd=None):
+    """Boot or reuse a persistent container for this project.
+
+    Container lookup order:
+      1. Disk — persisted container ID for this project path (survives process restarts)
+      2. Class variable — standby from earlier in the same process (interactive shell)
+      3. Create fresh
+
+    Workspace is always reset from the snapshot before handing off to the agent.
+    setup_cmd runs only on a fresh container (not on warm reuse) after env vars are written.
+    """
+```
+
+#### 1. Disk Persistence (`sandbox/docker.py:152-175`)
+
+```python
+existing_id = None
+if self._project_path:
+    cfile = _container_file(self._project_path)
+    lock_path = _container_lock_file(self._project_path)
+    lock_fd = open(lock_path, "w")
+    try:
+        if _FCNTL_AVAILABLE:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if cfile.exists():
+            stored = cfile.read_text().strip()
+            if stored and self._is_alive(stored):
+                existing_id = stored
+                # Claim it by removing the file — the next caller
+                # won't see it and will create a fresh container.
+                cfile.unlink(missing_ok=True)
+            else:
+                cfile.unlink(missing_ok=True)  # stale reference
+    finally:
+        if _FCNTL_AVAILABLE:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+```
+
+**Why file locking?** Two concurrent `ftl code` invocations for the same project could race to claim the same container. The lock ensures only one session acquires it.
+
+**Container file path:**
+```python
+def _container_file(project_path):
+    slug = hashlib.md5(str(project_path).encode()).hexdigest()[:12]
+    container_dir = Path.home() / ".ftl" / "containers"
+    container_dir.mkdir(parents=True, exist_ok=True)
+    return container_dir / slug
+```
+
+Example: `/Users/you/.ftl/containers/a3f8b2c1d4e5`
+
+#### 2. In-Process Standby (`sandbox/docker.py:177-182`)
+
+```python
+if existing_id is None:
+    with DockerSandbox._lock:
+        if DockerSandbox._standby_id and self._is_alive(DockerSandbox._standby_id):
+            existing_id = DockerSandbox._standby_id
+            DockerSandbox._standby_id = None
+```
+
+This enables warm reuse in interactive mode (`ftl` shell) without hitting the filesystem between tasks.
+
+#### 3. Create Fresh (`sandbox/docker.py:184-190`)
+
+```python
+self.fresh = existing_id is None
+if existing_id:
+    self.container_id = existing_id
+    self._init_workspace(snapshot_id, wipe=True)
+else:
+    self.container_id = self._create()
+    self._init_workspace(snapshot_id, wipe=False)
+```
+
+**Fresh container creation** (`sandbox/docker.py:301-318`):
+```python
+def _create(self):
+    """Create a container with the snapshots dir bind-mounted read-only."""
+    snapshots_dir = str((Path.home() / ".ftl" / "snapshots").resolve())
+    Path(snapshots_dir).mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "docker", "run", "-d",
+        "--network=bridge",
+        "--add-host=host.docker.internal:host-gateway",
+        "--memory=2g",
+        "--cpus=2",
+        "-v", f"{snapshots_dir}:/mnt/snapshots:ro",
+        "-w", "/workspace",
+        IMAGE,
+        "sleep", "infinity",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return result.stdout.strip()
+```
+
+**Resource limits:**
+- 2GB memory
+- 2 CPU cores
+- Snapshots mounted read-only at `/mnt/snapshots`
+- `host.docker.internal` resolves to the host gateway (enables proxy routing)
+
+<Note>
+The read-only snapshot mount prevents accidental modification of the baseline state.
+</Note>
+
+### Workspace Initialization
+
+**Reset workspace from snapshot** (`sandbox/docker.py:351-365`):
+```python
+def _init_workspace(self, snapshot_id, wipe=False):
+    """Populate /workspace from snapshot. If wipe=True, clears it first."""
+    cmds = []
+    if wipe:
+        cmds.append("find /workspace -mindepth 1 -delete")
+    cmds.extend([
+        f"cp -a /mnt/snapshots/{snapshot_id}/. /workspace/",
+        "rm -f /workspace/.ftl_meta",
+        "chown -R ftl:ftl /workspace",
+    ])
+    result = self.exec_as_root("; ".join(cmds))
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to initialize workspace: {result.stderr or result.stdout}"
+        )
+```
+
+**Why wipe?** On warm container reuse, `/workspace` contains files from the previous task. We wipe it before copying the new snapshot.
+
+**Ownership reset:** The `ftl` user (UID 1000) owns all files in `/workspace`.
+
+### Environment Variable Injection
+
+All credentials and agent auth keys are written to `/tmp/.ftl_env`:
+
+```python
+all_env = {**self._credentials, **self._agent_env}
+if all_env:
+    env_lines = "\n".join(f"export {k}='{v}'" for k, v in all_env.items())
+    subprocess.run(
+        ["docker", "exec", self.container_id, "sh", "-c",
+         f"cat > {ENV_FILE} << 'FTLEOF'\n{env_lines}\nFTLEOF"],
+        capture_output=True,
+    )
+```
+
+Example `/tmp/.ftl_env` contents:
+```bash
+export STRIPE_SECRET_KEY='ftl_shadow_stripe_secret_key_7f8a2b3c'
+export OPENAI_API_KEY='ftl_shadow_openai_api_key_4d9e2a1f'
+export ANTHROPIC_API_KEY='sk-ant-api03-...'
+```
+
+Shadow credentials and real agent auth keys coexist — the agent's API key is real, but project secrets are fake.
+
+### Setup Command Execution
+
+**Runs once on fresh containers only** (`sandbox/docker.py:208-211`):
+```python
+if self.fresh and setup_cmd:
+    self._run_setup(setup_cmd)
+```
+
+**Implementation** (`sandbox/docker.py:328-337`):
+```python
+def _run_setup(self, cmd):
+    """Run the project setup command as the ftl user with credentials sourced."""
+    result = subprocess.run(
+        ["docker", "exec", "-u", "ftl", "-w", "/workspace",
+         self.container_id, "sh", "-c", self._with_env(cmd)],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    return result
+```
+
+Setup has a 5-minute timeout. Installed packages persist in `/home/ftl/.local/` for the container's lifetime.
+
+### Node.js Pre-Warming
+
+Claude Code's first invocation has a 5-8s cold-start penalty as Node.js loads modules. FTL pre-warms the cache in the background:
+
+```python
+threading.Thread(target=self._prewarm_node, daemon=True).start()
+```
+
+**Implementation** (`sandbox/docker.py:339-349`):
+```python
+def _prewarm_node(self):
+    """Load Claude Code into the Linux page cache by running a no-op invocation.
+
+    Runs in a background thread during boot() so the first agent task doesn't
+    pay the Node.js cold-start penalty (~5-8s).
+    """
+    subprocess.run(
+        ["docker", "exec", "-u", "ftl", self.container_id, "sh", "-c", "claude --version"],
+        capture_output=True,
+        timeout=30,
+    )
+```
+
+By the time the user sees "Running agent...", Claude Code is already warm.
+
+## Command Execution
+
+### Non-Streaming Execution
+
+```python
+def exec(self, command, timeout=DEFAULT_TIMEOUT):
+    """Run a command inside the container with credentials sourced."""
+    try:
+        result = subprocess.run(
+            ["docker", "exec", self.container_id, "sh", "-c", self._with_env(command)],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, "", f"Command timed out after {timeout}s"
+
+    return result.returncode, result.stdout, result.stderr
+```
+
+**Automatic env sourcing:**
+```python
+def _with_env(self, cmd):
+    """Prepend ENV_FILE sourcing if any credentials/agent env are configured."""
+    if self._credentials or self._agent_env:
+        return f". {ENV_FILE} && {cmd}"
+    return cmd
+```
+
+Every command gets shadow credentials and agent auth keys without explicit sourcing.
+
+### Streaming Execution
+
+```python
+def exec_stream(self, command, callback=None, timeout=DEFAULT_TIMEOUT):
+    """Run a command inside the container, streaming output line-by-line.
+
+    Merges stderr into stdout so errors appear live. Accumulates full output
+    and returns (exit_code, stdout, stderr) matching the exec() interface.
+    """
+    proc = subprocess.Popen(
+        ["docker", "exec", self.container_id, "sh", "-c", self._with_env(command)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    lines = []
+    try:
+        for line in proc.stdout:
+            lines.append(line)
+            if callback:
+                callback(line)
+    except KeyboardInterrupt:
+        proc.terminate()
+        raise
+    proc.wait()
+    return proc.returncode, "".join(lines), ""
+```
+
+**Key behaviors:**
+- Output streams line-by-line immediately
+- Ctrl+C terminates the container process
+- Full output accumulated for return value
+- No timeout enforcement (caller controls via thread/future)
+
+### Root Execution
+
+```python
+def exec_as_root(self, cmd):
+    """Run a shell command inside the container as root."""
+    return subprocess.run(
+        ["docker", "exec", "-u", "root", self.container_id, "sh", "-c", cmd],
+        capture_output=True,
+        text=True,
+    )
+```
+
+Used for:
+- Workspace initialization (`chown -R ftl:ftl /workspace`)
+- Proxy CA installation
+- System-level setup
+
+## Diff Computation
+
+Diffs run **inside the Linux container** to avoid host-side Python walking through VirtioFS per file.
+
+### Linux-Internal Diff Script
+
+The sandbox generates a Python script and runs it inside the container:
+
+**Template** (`sandbox/docker.py:22-83`):
+```python
+_DIFF_SCRIPT_TMPL = """
+import os, json, base64, hashlib
+from pathlib import Path
+
+SNAP = Path('/mnt/snapshots/{snapshot_id}')
+WORK = Path('/workspace')
+IGNORE = {{'__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache',
+           'node_modules', 'site-packages', 'venv', '.venv'}}
+SUFFIXES = ('.dist-info', '.egg-info', '.egg-link')
+SKIP_FILES = {{'_ftl_test.py', '_ftl_test.js', '.ftl_meta'}}
+
+def skip(rel):
+    p = Path(rel)
+    if p.name in SKIP_FILES:
+        return True
+    for part in p.parts:
+        if part in IGNORE or part.endswith(tuple(SUFFIXES)):
+            return True
+    return False
+
+def digest(path):
+    h = hashlib.md5()
+    try:
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(65536), b''):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+snap_files = {{
+    str(f.relative_to(SNAP))
+    for f in SNAP.rglob('*')
+    if f.is_file() and f.name != '.ftl_meta' and not skip(str(f.relative_to(SNAP)))
+}}
+work_files = {{
+    str(f.relative_to(WORK))
+    for f in WORK.rglob('*')
+    if f.is_file() and not skip(str(f.relative_to(WORK)))
+}}
+
+results = []
+for rel in sorted(snap_files - work_files):
+    results.append({{'path': rel, 'deleted': True}})
+for rel in sorted(work_files - snap_files):
+    try:
+        content = open(WORK / rel, 'rb').read()
+        results.append({{'path': rel, 'deleted': False,
+                         'content_b64': base64.b64encode(content).decode()}})
+    except OSError:
+        pass
+for rel in sorted(snap_files & work_files):
+    if digest(SNAP / rel) != digest(WORK / rel):
+        try:
+            content = open(WORK / rel, 'rb').read()
+            results.append({{'path': rel, 'deleted': False,
+                             'content_b64': base64.b64encode(content).decode()}})
+        except OSError:
+            pass
+
+print(json.dumps(results))
+"""
+```
+
+**Why base64?** Binary file contents can contain characters that break JSON. Base64 ensures safe transport.
+
+### Diff Execution
+
+```python
+def get_diff(self, snapshot_path):
+    """Return structured diffs by comparing /workspace against the snapshot.
+
+    The comparison runs inside the Linux VM container — no host-side Python
+    walking through VirtioFS. Returns the same format as diff.compute_diff().
+    """
+    snapshot_id = Path(snapshot_path).name
+    script = _DIFF_SCRIPT_TMPL.format(snapshot_id=snapshot_id)
+    cmd = (
+        f"cat > /tmp/_ftl_diff.py << 'PYEOF'\n{script}\nPYEOF\n"
+        "python3 /tmp/_ftl_diff.py\n"
+        "rm -f /tmp/_ftl_diff.py"
+    )
+    result = self.exec_as_root(cmd)
+    try:
+        overlay_changes = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+    from ftl.diff import compute_diff_from_overlay
+    return compute_diff_from_overlay(overlay_changes, snapshot_path)
+```
+
+**Performance:** On a 1000-file project, Linux-internal diff completes in ~500ms vs. 3-5s for host-side Python walking through Docker Desktop's VirtioFS.
+
+## Standby and Cleanup
+
+### Standby (`sandbox/docker.py:285-290`)
+
+```python
+def standby(self):
+    """Release the container — keep it running for reuse (disk + class var)."""
+    with DockerSandbox._lock:
+        DockerSandbox._standby_id = self.container_id
+    # Disk file already written in boot(); nothing more to do here
+    self.container_id = None
+```
+
+The container:
+- Continues running in the background
+- Is marked as available in class-level state
+- Has its ID persisted to disk
+- Will be reused by the next `ftl code` invocation
+
+### Exit Cleanup (`sandbox/docker.py:375-383`)
+
+```python
+def _cleanup_on_exit(self):
+    """On process exit, leave containers running — they're reused by the next invocation.
+
+    Only clears in-memory references; the disk file written in boot() ensures
+    the container is found again even after the process restarts.
+    """
+    self.container_id = None
+    with DockerSandbox._lock:
+        DockerSandbox._standby_id = None
+```
+
+**Containers are never destroyed on normal exit.** They persist until explicitly removed with `docker rm -f`.
+
+### Manual Destroy
+
+```python
+def destroy(self):
+    """Kill and remove the container."""
+    if self.container_id:
+        subprocess.run(
+            ["docker", "rm", "-f", self.container_id],
+            capture_output=True,
+        )
+        self.container_id = None
+```
+
+Not called during normal operation — only for explicit cleanup commands.
+
+## Container State Tracking
+
+```python
+def _is_alive(self, container_id):
+    result = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Running}}", container_id],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0 and "true" in result.stdout
+```
+
+Checks if a container ID is still running. Used during boot to validate persisted container references.
+
+## Image Validation
+
+```python
+def _check_image_exists():
+    """Check Docker is running and the ftl-sandbox image is built."""
+    result = subprocess.run(
+        ["docker", "images", "-q", IMAGE],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Docker is not running or not installed. "
+            "Start Docker Desktop and try again."
+        )
+    if not result.stdout.strip():
+        raise RuntimeError(
+            f"Docker image '{IMAGE}' not found. Run 'ftl setup' to build it."
+        )
+```
+
+Called at the start of every `boot()` to fail fast if Docker isn't ready.
+
+## Performance Characteristics
+
+| Operation | Cold | Warm | Notes |
+|-----------|------|------|-------|
+| Container boot | 2-5s | &lt;100ms | Warm = reuse existing container |
+| Workspace reset | ~500ms | ~500ms | Always runs (rsync from snapshot) |
+| Setup command | 10-60s | 0s | Only on fresh containers |
+| Node.js pre-warm | 5-8s | 0s | Background thread during boot |
+| Diff computation | ~500ms | ~500ms | Linux-internal (vs 3-5s host-side) |
+
+## Security Properties
+
+1. **Filesystem isolation** — Agent sees only `/workspace` and system paths
+2. **Read-only snapshots** — `/mnt/snapshots` mounted read-only
+3. **Shadow credentials** — Real secrets never written to container env
+4. **Network isolation** — Can route through proxy for credential swapping
+5. **Resource limits** — 2GB RAM, 2 CPU cores prevent runaway processes
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Session Orchestration" icon="gears" href="/architecture/orchestrator">
+    How the sandbox integrates into the session lifecycle
+  </Card>
+  <Card title="Agent Adapters" icon="robot" href="/architecture/agents">
+    How agents execute commands inside the sandbox
+  </Card>
+</CardGroup>
